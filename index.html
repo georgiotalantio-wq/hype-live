@@ -14,8 +14,20 @@ header{display:flex;flex-wrap:wrap;align-items:baseline;gap:18px;padding:10px 16
 select,button.sm{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;cursor:pointer}
 #chart{position:relative;height:calc(100vh - 230px);min-height:460px;border-bottom:1px solid var(--line)}
 #moreopts{display:contents}#moreopts>summary{display:none}
-.hinfo{position:absolute;top:6px;left:8px;right:80px;pointer-events:none;display:flex;flex-direction:column;gap:2px;font-size:12px;font-variant-numeric:tabular-nums;color:#e6e3f5}
-.hrow{background:rgba(14,10,36,.72);padding:2px 6px;border-radius:3px;align-self:flex-start;white-space:pre-wrap}.hbig{color:#fde74c;font-weight:600}
+.hinfo{position:absolute;top:6px;left:8px;right:150px;pointer-events:none;display:flex;flex-direction:column;gap:1px;font-size:12px;font-variant-numeric:tabular-nums;color:#d1d4dc}
+.hrow{padding:1px 2px;align-self:flex-start;white-space:pre-wrap;text-shadow:0 0 3px #131722,0 0 3px #131722}.hrow .k{color:#787b86}.hrow .s{color:#b2b5be;font-weight:600}.hbig{color:#fde74c;font-weight:600;background:rgba(19,23,34,.85);border-radius:3px;padding:2px 6px}
+/* chart window controls: minimize / window / fullscreen */
+:root{--tgtop:calc(var(--tg-safe-area-inset-top,0px) + var(--tg-content-safe-area-inset-top,0px))}
+.wctl{position:absolute;top:6px;right:80px;z-index:5;display:flex;gap:4px}
+.wctl button{width:28px;height:26px;display:grid;place-items:center;padding:0;background:rgba(19,23,34,.85);border:1px solid #2a2e39;border-radius:6px;color:#b2b5be;cursor:pointer}
+.wctl button:hover{color:#fff;background:#2a2e39}.wctl svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+body.chartmax{overflow:hidden}
+body.chartmax header,body.chartmax nav.tabs,body.chartmax .mnav,body.chartmax .grid,body.chartmax .note,body.chartmax .mdeal,body.chartmax .mmore{display:none!important}
+body.chartmax .bar{position:fixed!important;left:0;right:0;top:var(--tgtop)!important;z-index:60;background:var(--panel)}
+body.chartmax #chart{position:fixed;left:0;right:0;top:calc(var(--tgtop) + var(--barh,44px));bottom:0;height:auto!important;min-height:0!important;z-index:55;background:#131722;padding-bottom:env(safe-area-inset-bottom);border:0}
+body.chartmin #chart{height:38px!important;min-height:0!important}body.chartmin #chart canvas,body.chartmin .hinfo{display:none!important}
+body.chartmin #chart::before{content:'График свёрнут';position:absolute;left:14px;top:10px;color:var(--mut)}
+.mtoast{position:fixed;left:50%;bottom:calc(90px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#2a2e39;color:#fff;padding:10px 14px;border-radius:10px;z-index:100;font-size:13px;max-width:90vw;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.5)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:12px;padding:12px 16px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;min-width:0}
 .card h3{margin:0 0 8px;font-size:14px}
@@ -41,7 +53,8 @@ td.best{color:#2962ff;font-weight:700}td.warn{color:#ffb74d}.rlist{margin:0;padd
 .mgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.mcell{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:6px;padding:8px}.mk{color:var(--mut);font-size:12px}.mv{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}.ms{color:var(--mut);font-size:11px}
 #news a{color:#82b1ff}
 .note{color:var(--mut);font-size:12px;padding:0 16px 16px}
-body.m .hinfo{font-size:10px!important;right:56px!important;gap:0!important}
+body.m .hinfo{font-size:11px!important;right:160px!important;gap:0!important}
+body.m .wctl button{width:34px;height:32px}
 /* ---------- mobile / Telegram Mini App shell ---------- */
 body.m{font-size:14px;padding-bottom:calc(64px + env(safe-area-inset-bottom))}
 body.m header{position:sticky;top:0;z-index:30;gap:2px 10px;padding:8px 12px;align-items:center}
@@ -346,7 +359,8 @@ window.hxTrades = () => {
 };
 window.hxIdxAt = (E, t) => { let lo = 0, hi = E.n - 1; while (lo < hi) { const m = (lo + hi + 1) >> 1; if (E.T[m] <= t) lo = m; else hi = m - 1; } return lo; };
 </script>
-<script>window.hxLayers = window.hxLayers || {heat: true, ema: true, struct: true, div: true, fvg: false, fig: false, trades: true, analog: false};
+<script>// clean exchange-style chart by default; every layer is still in "Слои", and the choice is remembered
+window.hxLayers = window.hxLayers || Object.assign({heat: false, ema: true, struct: false, div: false, trend: false, fvg: false, fig: false, trades: false, analog: false}, (() => { try { return JSON.parse(localStorage.getItem('hype_layers') || '{}'); } catch (e) { return {}; } })());
 
 window.hxPaint = (st) => {
   const {cv, info} = st, E = st.eng, Ly = hxLayers;
@@ -355,15 +369,17 @@ window.hxPaint = (st) => {
   if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
   const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
   const BG = Ly.heat ? '#070b2e' : '#131722'; st.H = cv.clientHeight || st.H;
+  const GRID = Ly.heat ? 'rgba(255,255,255,0.05)' : 'rgba(42,46,57,0.7)', AXT = '#b2b5be', XH = 'rgba(149,152,161,0.65)', XHBG = '#363a45';
+  const tfName = String(st.pane.dataset.tf || '').replace(/h$/, 'H').replace(/d$/, 'D').replace(/w$/, 'W');
   g.fillStyle = BG; g.fillRect(0, 0, W, H);
   info.replaceChildren();
   if (!E) { g.fillStyle = 'rgba(255,255,255,0.5)'; g.font = '12px system-ui, sans-serif'; g.fillText('Загружаю историю…', 12, 24); return; }
   const A = hxAnalyze(E), AN = Ly.analog ? hxAnalogs(E) : null;
   const n = E.n, NB = E.NB, tf = hxTF[st.pane.dataset.tf];
   if (!st.view) {
-    const a = Math.max(0, n - 150); let lo = Infinity, hi = 0; for (let i = a; i < n; i++) { lo = Math.min(lo, E.L[i]); hi = Math.max(hi, E.H[i]); }
-    const pad = Math.max(0.05, Math.log(hi / lo) * 0.4);
-    st.view = {i0: a - 0.5, i1: n - 0.5 + 24, l0: Math.log(lo) - pad, l1: Math.log(hi) + pad};
+    const narrow = PW < 520, a = Math.max(0, n - (narrow ? 70 : 140)); let lo = Infinity, hi = 0; for (let i = a; i < n; i++) { lo = Math.min(lo, E.L[i]); hi = Math.max(hi, E.H[i]); }
+    const pad = Math.max(0.01, Math.log(hi / lo) * 0.1);
+    st.view = {i0: a - 0.5, i1: n - 0.5 + (narrow ? 6 : 12), l0: Math.log(lo) - pad, l1: Math.log(hi) + pad};
   }
   const v = st.view;
   const s = Math.max(1, Math.ceil((v.i1 - v.i0) / (PW / 3)));
@@ -392,8 +408,14 @@ window.hxPaint = (st) => {
   g.save(); g.beginPath(); g.rect(0, 0, PW, PH); g.clip();
   const ticks = d3.scaleLog([pAt(PH), pAt(0)], [PH, 0]).ticks(12); const kept = [];
   ticks.forEach((p) => { if (!kept.length || Math.abs(Y(kept[kept.length - 1]) - Y(p)) > 26) kept.push(p); });
-  g.strokeStyle = 'rgba(255,255,255,0.06)'; g.lineWidth = 1;
+  g.strokeStyle = GRID; g.lineWidth = 1;
   kept.forEach((p) => { const y = Math.round(Y(p)) + .5; g.beginPath(); g.moveTo(0, y); g.lineTo(PW, y); g.stroke(); });
+  const cwG = PW / (v.i1 - v.i0) * s, everyG = Math.max(1, Math.ceil(90 / Math.max(cwG, 1)));
+  groups.forEach((gr, j) => { if ((g0 + j) % everyG === 0) { const x = Math.round(X((gr.a + gr.b) / 2)) + .5; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, PH); g.stroke(); } });
+  // faint symbol watermark, like on exchange charts
+  g.save(); g.fillStyle = 'rgba(255,255,255,0.035)'; g.font = '600 ' + Math.round(Math.min(64, PW / 8)) + 'px -apple-system, system-ui, sans-serif'; g.textAlign = 'center';
+  g.fillText('HYPEUSDT · ' + tfName, PW / 2, PH / 2); g.restore();
+  g.font = '11px system-ui, sans-serif'; g.textBaseline = 'middle';
   // heat levels
   if (Ly.heat && vmax > 0) groups.forEach((gr, j) => {
     const sn = shots[j], x0 = X(gr.a - 0.5), x1 = X(gr.b + 0.5) + 0.5;
@@ -431,12 +453,13 @@ window.hxPaint = (st) => {
     g.stroke();
   });
   // candles
-  const cw = PW / (v.i1 - v.i0) * s, bw = Math.max(1, Math.min(14, cw * 0.62));
+  const cw = PW / (v.i1 - v.i0) * s, bw = Math.max(1, Math.round(Math.min(24, cw * 0.72)));
   groups.forEach((gr) => {
-    const cx = X((gr.a + gr.b) / 2), up = gr.c >= gr.o, col = up ? '#26a69a' : '#ef5350';
-    g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 1;
-    g.beginPath(); g.moveTo(Math.round(cx) + .5, Y(gr.h)); g.lineTo(Math.round(cx) + .5, Y(gr.l)); g.stroke();
-    const y1 = Y(Math.max(gr.o, gr.c)), y2 = Y(Math.min(gr.o, gr.c)); g.fillRect(cx - bw / 2, y1, bw, Math.max(1, y2 - y1));
+    const cx = Math.round(X((gr.a + gr.b) / 2)), up = gr.c >= gr.o, col = up ? '#26a69a' : '#ef5350';
+    g.fillStyle = col;
+    const yh = Math.round(Y(gr.h)), yl = Math.round(Y(gr.l)); g.fillRect(cx, yh, 1, Math.max(1, yl - yh));
+    const y1 = Math.round(Y(Math.max(gr.o, gr.c))), y2 = Math.round(Y(Math.min(gr.o, gr.c)));
+    g.fillRect(cx - Math.floor(bw / 2) + (bw % 2 ? 0 : 1), y1, bw, Math.max(1, y2 - y1));
   });
   // structure
   if (Ly.struct) {
@@ -529,12 +552,12 @@ window.hxPaint = (st) => {
       });
     }
   }
-  const yc = Y(lastC);
-  g.setLineDash([2, 3]); g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 1; g.beginPath(); g.moveTo(0, Math.round(yc) + .5); g.lineTo(PW, Math.round(yc) + .5); g.stroke(); g.setLineDash([]);
+  const yc = Y(lastC), lastUp = lastC >= E.O[n - 1], LCOL = lastUp ? '#26a69a' : '#ef5350';
+  g.setLineDash([1, 2]); g.strokeStyle = LCOL; g.lineWidth = 1; g.beginPath(); g.moveTo(0, Math.round(yc) + .5); g.lineTo(PW, Math.round(yc) + .5); g.stroke(); g.setLineDash([]);
   let hov = null;
   if (st.hover && !st.drag && st.hover[0] < PW && st.hover[1] < PH && groups.length) {
     const [hx, hy] = st.hover;
-    g.setLineDash([3, 3]); g.strokeStyle = 'rgba(255,255,255,0.45)';
+    g.setLineDash([4, 4]); g.strokeStyle = XH; g.lineWidth = 1;
     g.beginPath(); g.moveTo(0, Math.round(hy) + .5); g.lineTo(PW, Math.round(hy) + .5); g.moveTo(Math.round(hx) + .5, 0); g.lineTo(Math.round(hx) + .5, PH); g.stroke(); g.setLineDash([]);
     const iAt = v.i0 + hx / PW * (v.i1 - v.i0);
     const j = Math.max(0, Math.min(groups.length - 1, Math.floor(iAt / s) - g0));
@@ -548,32 +571,41 @@ window.hxPaint = (st) => {
   }
   g.restore();
   g.fillStyle = BG; g.fillRect(PW, 0, AX, H); g.fillRect(0, PH, W, TX);
-  g.strokeStyle = 'rgba(255,255,255,0.15)'; g.beginPath(); g.moveTo(PW + .5, 0); g.lineTo(PW + .5, PH); g.lineTo(0, PH + .5); g.stroke();
-  g.fillStyle = 'rgba(255,255,255,0.6)'; g.font = '11px system-ui, sans-serif'; g.textBaseline = 'middle';
+  g.strokeStyle = '#2a2e39'; g.lineWidth = 1; g.beginPath(); g.moveTo(PW + .5, 0); g.lineTo(PW + .5, PH); g.lineTo(0, PH + .5); g.stroke();
+  g.fillStyle = AXT; g.font = '11px -apple-system, system-ui, sans-serif'; g.textBaseline = 'middle';
   const fp = (p) => '$' + (p >= 100 ? p.toFixed(0) : p.toFixed(p >= 10 ? 1 : 2));
   kept.forEach((p) => { const y = Y(p); if (y > 6 && y < PH - 6) g.fillText(fp(p), PW + 6, y); });
   const tag = (y, txt, bg, fg) => { if (y < 0 || y > PH) return; g.fillStyle = bg; g.fillRect(PW + 1, y - 9, AX - 2, 18); g.fillStyle = fg; g.fillText(txt, PW + 6, y); };
   topLv.forEach((l) => tag(Y(l.p), '$' + l.p.toFixed(2), l.side ? '#ff5c7a' : '#3ddc97', '#131722'));
   if (window.APP && APP.fmode) (window.__axisTags || []).forEach((t) => tag(Y(t.p), '$' + t.p.toFixed(2), t.col, '#0b0e14'));
-  tag(yc, '$' + lastC.toFixed(2), '#ffffff', '#131722');
+  tag(yc, '$' + lastC.toFixed(2), LCOL, '#ffffff');
+  // countdown to the candle close under the price tag
+  if (n > 1 && yc > 0 && yc < PH - 20) {
+    const dur = E.T[n - 1] - E.T[n - 2], left = Math.max(0, E.T[n - 1] + dur - Date.now()), sec = Math.floor(left / 1000);
+    const pz = (x) => String(x).padStart(2, '0'), d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+    const cd = d ? d + 'д ' + h + 'ч' : h ? pz(h) + ':' + pz(m) + ':' + pz(sec % 60) : pz(m) + ':' + pz(sec % 60);
+    g.fillStyle = LCOL; g.globalAlpha = 0.8; g.fillRect(PW + 1, yc + 9, AX - 2, 16); g.globalAlpha = 1; g.fillStyle = '#ffffff'; g.fillText(cd, PW + 6, yc + 17);
+  }
   const fA = d3.utcFormat(tf.fa), fT = d3.utcFormat(tf.ft);
   const every = Math.max(1, Math.ceil(90 / Math.max(cw, 1)));
-  g.textAlign = 'center'; g.fillStyle = 'rgba(255,255,255,0.6)';
+  g.textAlign = 'center'; g.fillStyle = AXT;
   groups.forEach((gr, j) => { if ((g0 + j) % every === 0) { const x = X((gr.a + gr.b) / 2); if (x > 24 && x < PW - 24) g.fillText(fA(new Date(gr.t)), x, PH + TX / 2); } });
   g.textAlign = 'left';
   const gl = hov ? hov.gr : groups[groups.length - 1];
   if (hov) {
-    tag(st.hover[1], '$' + hov.price.toFixed(2), '#6b6b8a', '#ffffff');
+    tag(st.hover[1], '$' + hov.price.toFixed(2), XHBG, '#ffffff');
     const x = X((gl.a + gl.b) / 2), txt = fT(new Date(gl.t)), tw = g.measureText(txt).width;
     const bx = Math.min(PW - tw - 8, Math.max(0, x - tw / 2 - 4));
-    g.fillStyle = '#6b6b8a'; g.fillRect(bx, PH + 1, tw + 8, TX - 2); g.fillStyle = '#ffffff'; g.fillText(txt, bx + 4, PH + TX / 2);
+    g.fillStyle = XHBG; g.fillRect(bx, PH + 1, tw + 8, TX - 2); g.fillStyle = '#ffffff'; g.fillText(txt, bx + 4, PH + TX / 2);
   }
-  const row = (txt, cls) => { const r = document.createElement('div'); r.className = 'hrow' + (cls ? ' ' + cls : ''); r.textContent = txt; info.appendChild(r); };
-  const bi = gl.b;
-  row(fT(new Date(gl.t)) + ' UTC' + (s > 1 ? ' (свечи объединены по ' + s + ')' : '') + '   O ' + gl.o.toFixed(2) + '  H ' + gl.h.toFixed(2) + '  L ' + gl.l.toFixed(2) + '  C ' + gl.c.toFixed(2));
-  row((Ly.ema ? 'EMA50 ' + A.e50[bi].toFixed(2) + '  EMA200 ' + A.e200[bi].toFixed(2) + '  ' : '') + 'RSI ' + (isNaN(A.rsi[bi]) ? '—' : A.rsi[bi].toFixed(0)));
+  const row = (txt, cls) => { const r = document.createElement('div'); r.className = 'hrow' + (cls ? ' ' + cls : ''); r.textContent = txt; info.appendChild(r); return r; };
+  // exchange-style legend: symbol · TF, then O H L C coloured by the candle, change %
+  const legend = (parts) => { const r = row(''); parts.forEach(([t, c, cls]) => { const sp = document.createElement('span'); sp.textContent = t; if (c) sp.style.color = c; if (cls) sp.className = cls; r.appendChild(sp); }); };
+  const bi = gl.b, lc = gl.c >= gl.o ? '#26a69a' : '#ef5350', chg = (gl.c / gl.o - 1) * 100;
+  legend([['HYPEUSDT · ' + tfName + (PW < 520 ? '  ' : ' · Bybit  '), null, 's'], ['O ', null, 'k'], [gl.o.toFixed(3) + ' ', lc], ['H ', null, 'k'], [gl.h.toFixed(3) + ' ', lc], ['L ', null, 'k'], [gl.l.toFixed(3) + ' ', lc], ['C ', null, 'k'], [gl.c.toFixed(3) + ' ', lc], [(chg >= 0 ? '+' : '') + chg.toFixed(2) + '%', lc]]);
+  if (Ly.ema) legend([['EMA 50 ', null, 'k'], [A.e50[bi].toFixed(3) + '  ', '#4fc3f7'], ['EMA 200 ', null, 'k'], [A.e200[bi].toFixed(3), '#ffb74d']]);
+  if (s > 1) row('свечи объединены по ' + s).className = 'hrow k';
   if (hov && hov.lvl) row('Уровень $' + E.price(hov.lvl.k).toFixed(2) + ': ' + hxLiq(hov.lvl.val) + (hov.lvl.short ? ' шортов' : ' лонгов') + ' к ликвидации', 'hbig');
-  else if (!hov && window.innerWidth >= 700) row('Колесо: масштаб времени. Тяни график: сдвиг. Тяни шкалу цены: растянуть. Двойной клик: сброс.');
 };
 
 // Text breakdown of the selected timeframe, written from the same analysis the chart draws.
@@ -715,7 +747,7 @@ window.hxElliott = (E, zz) => {
   return null;
 };
 </script>
-<script>window.hxLayers={heat:true,ema:true,struct:true,div:true,fvg:false,fig:false,trades:true,analog:false,trend:true};
+<script>// layer defaults + saved choice are set where hxLayers is first defined
 'use strict';
 // ---------- data layer: Bybit REST history (cached in IndexedDB) + WebSocket live stream ----------
 const API = 'https://api.bybit.com', WS_URL = 'wss://stream.bybit.com/v5/public/linear', SYM = 'HYPEUSDT';
@@ -954,10 +986,74 @@ window.hxClusters = (tb, E) => {
   });
 };
 
+// ---------- chart window controls: minimize / restore to window / fullscreen ----------
+function hxWindowControls(el) {
+  const T = window.Telegram && window.Telegram.WebApp, inTg = !!(T && T.initData);
+  const tgFS = inTg && typeof T.requestFullscreen === 'function' && (!T.isVersionAtLeast || T.isVersionAtLeast('8.0'));
+  const ICON = {
+    min: '<svg viewBox="0 0 14 14"><path d="M3 10.5h8"/></svg>',
+    max: '<svg viewBox="0 0 14 14"><path d="M2 5V2h3M9 2h3v3M12 9v3H9M5 12H2V9"/></svg>',
+    win: '<svg viewBox="0 0 14 14"><path d="M5 2v3H2M9 2v3h3M12 9H9v3M2 9h3v3"/></svg>',
+    up: '<svg viewBox="0 0 14 14"><path d="M3 8.5l4-4 4 4"/></svg>'
+  };
+  const box = document.createElement('div'); box.className = 'wctl';
+  const bMin = document.createElement('button'), bMax = document.createElement('button');
+  box.append(bMin, bMax); el.appendChild(box);
+  const haptic = () => { try { T && T.HapticFeedback && T.HapticFeedback.impactOccurred('light'); } catch (e) {} };
+  const isMax = () => document.body.classList.contains('chartmax'), isMin = () => document.body.classList.contains('chartmin');
+  const sync = () => {
+    bMax.innerHTML = isMax() ? ICON.win : ICON.max; bMax.title = isMax() ? 'Свернуть в окно' : 'На весь экран';
+    bMin.innerHTML = isMin() ? ICON.up : ICON.min; bMin.title = isMin() ? 'Развернуть график' : (inTg ? 'Свернуть мини-апп' : 'Свернуть график');
+    bMax.setAttribute('aria-label', bMax.title); bMin.setAttribute('aria-label', bMin.title);
+    const bar = document.querySelector('#pane-term .bar');
+    requestAnimationFrame(() => document.body.style.setProperty('--barh', (bar && isMax() ? bar.offsetHeight : 0) + 'px'));
+  };
+  const toast = (txt) => { const t = document.createElement('div'); t.className = 'mtoast'; t.textContent = txt; document.body.appendChild(t); setTimeout(() => t.remove(), 4500); };
+  let browserFS = false;
+  function setMax(on) {
+    if (on === isMax()) return;
+    document.body.classList.toggle('chartmax', on); document.body.classList.remove('chartmin');
+    if (on) {
+      window.scrollTo(0, 0);
+      if (tgFS) { try { T.requestFullscreen(); } catch (e) {} }
+      else if (!inTg && document.documentElement.requestFullscreen && !document.fullscreenElement) document.documentElement.requestFullscreen().then(() => { browserFS = true; }).catch(() => {});
+    } else {
+      if (tgFS && T.isFullscreen) { try { T.exitFullscreen(); } catch (e) {} }
+      if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      browserFS = false;
+    }
+    sync();
+  }
+  bMax.onclick = () => { haptic(); setMax(!isMax()); };
+  bMin.onclick = () => {
+    haptic();
+    if (isMin()) { document.body.classList.remove('chartmin'); sync(); return; }
+    if (inTg) {
+      setMax(false);
+      if (typeof T.minimize === 'function') { try { T.minimize(); return; } catch (e) {} }
+      // Telegram has no "minimize" call for mini apps: unlock the native swipe-down gesture for a moment
+      try { T.enableVerticalSwipes && T.enableVerticalSwipes(); } catch (e) {}
+      toast('Смахни мини-апп вниз за шапку, чтобы свернуть его');
+      setTimeout(() => { try { T.disableVerticalSwipes && T.disableVerticalSwipes(); } catch (e) {} }, 8000);
+      return;
+    }
+    setMax(false); document.body.classList.add('chartmin'); sync();
+  };
+  document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && browserFS) { browserFS = false; setMax(false); } });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && isMax()) setMax(false); });
+  if (inTg && T.onEvent) {
+    T.onEvent('fullscreenChanged', () => { if (!T.isFullscreen && isMax()) { document.body.classList.remove('chartmax'); sync(); } });
+    T.onEvent('safeAreaChanged', sync); T.onEvent('contentSafeAreaChanged', sync);
+  }
+  window.addEventListener('resize', sync);
+  sync();
+}
+
 // ---------- chart mount (pan / zoom like an exchange) ----------
 function mountChart(el) {
   const cv = document.createElement('canvas'); cv.style.cssText = 'display:block;width:100%;height:100%;touch-action:none;cursor:crosshair';
   const info = document.createElement('div'); info.className = 'hinfo'; el.append(cv, info);
+  hxWindowControls(el);
   const st = {el, cv, info, view: null, hover: null, drag: null, AX: 72, TX: 22, H: 500, pane: {dataset: {tf: APP.tf}}};
   const P = (ev) => { const r = cv.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
   const zone = (x, y) => x > cv.clientWidth - st.AX ? 'price' : y > st.H - st.TX ? 'time' : 'plot';
@@ -1008,7 +1104,7 @@ async function switchTF(tf) {
 async function boot() {
   APP.st = mountChart($('#chart'));
   document.querySelectorAll('.tfb').forEach((b) => b.addEventListener('click', () => switchTF(b.dataset.tf)));
-  document.querySelectorAll('.layers input').forEach((cb) => { cb.checked = !!hxLayers[cb.dataset.ly]; cb.addEventListener('change', () => { hxLayers[cb.dataset.ly] = cb.checked; paint(); }); });
+  document.querySelectorAll('.layers input').forEach((cb) => { cb.checked = !!hxLayers[cb.dataset.ly]; cb.addEventListener('change', () => { hxLayers[cb.dataset.ly] = cb.checked; try { localStorage.setItem('hype_layers', JSON.stringify(hxLayers)); } catch (e) {} paint(); }); });
   $('#hx-min').addEventListener('input', (e) => { hxHeat.min = Number(e.target.value); $('#hx-minv').textContent = hxHeat.min.toFixed(2); paint(); renderSide(); });
   $('#rst').addEventListener('click', () => { APP.st.view = null; paint(); });
   $('#notif').addEventListener('click', async () => { try { const p = await Notification.requestPermission(); $('#notif').textContent = p === 'granted' ? 'Уведомления включены' : 'Уведомления запрещены браузером'; } catch (e) { $('#notif').textContent = 'Браузер не даёт уведомления, будет звук'; } beep(); });
