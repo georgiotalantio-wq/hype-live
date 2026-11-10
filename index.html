@@ -554,6 +554,7 @@ window.hxPaint = (st) => {
   kept.forEach((p) => { const y = Y(p); if (y > 6 && y < PH - 6) g.fillText(fp(p), PW + 6, y); });
   const tag = (y, txt, bg, fg) => { if (y < 0 || y > PH) return; g.fillStyle = bg; g.fillRect(PW + 1, y - 9, AX - 2, 18); g.fillStyle = fg; g.fillText(txt, PW + 6, y); };
   topLv.forEach((l) => tag(Y(l.p), '$' + l.p.toFixed(2), l.side ? '#ff5c7a' : '#3ddc97', '#131722'));
+  if (window.APP && APP.fmode) (window.__axisTags || []).forEach((t) => tag(Y(t.p), '$' + t.p.toFixed(2), t.col, '#0b0e14'));
   tag(yc, '$' + lastC.toFixed(2), '#ffffff', '#131722');
   const fA = d3.utcFormat(tf.fa), fT = d3.utcFormat(tf.ft);
   const every = Math.max(1, Math.ceil(90 / Math.max(cw, 1)));
@@ -1157,7 +1158,11 @@ function computeForecast() {
   const dn1 = dnl[0] || {p: dnTrig - 2 * atr, src: '2 ATR'}, dn2 = dnl.find((x) => x.p < dn1.p - 0.5 * atr) || {p: dn1.p - 2 * atr, src: '+2 ATR'};
   const bear = score <= -2 || (O.strat && !(S && S.regNow));
   let shortPlan = null;
-  if (bear && !inPos) { const sLo = Math.min(c, e200), sHi = Math.max(c, e200) + 0.5 * atr, se = (sLo + sHi) / 2, ss = se + 2 * atr; shortPlan = {sLo, sHi, sStop: ss, rr: (se - dn1.p) / Math.max(1e-9, ss - se)}; }
+  if (bear && !inPos) {
+    const rz = pick.filter((t) => t.p > c + 0.3 * atr).sort((a, b) => a.p - b.p)[0] || {p: Math.max(c + atr, Math.min(e200, c + 3 * atr)), src: ['EMA200 / +ATR']};
+    const sLo = rz.p - 0.25 * atr, sHi = rz.p + 0.25 * atr, se = rz.p, ss = sHi + 0.75 * atr;
+    shortPlan = {sLo, sHi, sStop: ss, src: (Array.isArray(rz.src) ? rz.src.slice(0, 2).join(', ') : rz.src), rr: (se - dn1.p) / Math.max(1e-9, ss - se)};
+  }
   let verdict, tone;
   if (inPos) { verdict = 'ДЕРЖАТЬ ЛОНГ по системе: вход $' + S.pos.ep.toFixed(2) + ', стоп $' + stop.toFixed(2) + ' (подтягивается на закрытии 4H). Новый вход не нужен'; tone = 'go'; }
   else if (O.strat && S && S.fresh) { verdict = 'СИГНАЛ СТРАТЕГИИ НА ВХОД: лонг на открытии текущей 4H-свечи, стоп $' + stop.toFixed(2); tone = 'go'; }
@@ -1171,41 +1176,62 @@ function computeForecast() {
 }
 
 window.hxForecastDraw = (g, P) => {
+  window.__axisTags = [];
   const fc = APP.fc, O = APP.fcOpt; if (!APP.fmode || !fc) return;
-  const {X, Y, PW, n, label, E} = P;
-  const x0 = Math.max(0, X(n - 1 - 25)), x1 = PW;
-  g.font = '11px system-ui, sans-serif'; g.textBaseline = 'middle';
-  // component lines first, under the plan
+  const {X, Y, PW, PH, n, E} = P;
+  const font = (s, w) => { g.font = (w ? w + ' ' : '') + s + 'px -apple-system, "Segoe UI", system-ui, sans-serif'; };
+  const fp = (p) => p >= 100 ? p.toFixed(1) : p.toFixed(2);
+  const rgba = (hex, a) => { const v = parseInt(hex.slice(1), 16); return 'rgba(' + (v >> 16 & 255) + ',' + (v >> 8 & 255) + ',' + (v & 255) + ',' + a + ')'; };
+  g.textBaseline = 'middle';
+  const xs = X(n - 1 - 36), labs = [];
+  // horizontal level: thin line to the right edge, label right-aligned above the line, price tag on the axis
+  const hl = (p, col, txt, o = {}) => { const y = Y(p); if (y < -30 || y > PH + 30) return; const x0 = o.x0 != null ? o.x0 : xs; g.strokeStyle = rgba(col, o.a || 0.9); g.lineWidth = o.w || 1; g.setLineDash(o.dash || []); g.beginPath(); g.moveTo(x0, y); g.lineTo(PW, y); g.stroke(); g.setLineDash([]); labs.push({y, col, txt}); if (o.tag !== false) window.__axisTags.push({p, col}); };
+  // zone: faint band with thin edges
+  const zone = (lo, hi, col, txt, x0 = xs) => { const y0 = Y(hi), y1 = Y(lo); if (y1 < -30 || y0 > PH + 30) return; g.fillStyle = rgba(col, 0.13); g.fillRect(x0, y0, PW - x0, Math.max(2, y1 - y0)); g.strokeStyle = rgba(col, 0.7); g.lineWidth = 1; g.beginPath(); g.moveTo(x0, y0); g.lineTo(PW, y0); g.moveTo(x0, y1); g.lineTo(PW, y1); g.stroke(); labs.push({y: (y0 + y1) / 2, col, txt}); window.__axisTags.push({p: hi, col}, {p: lo, col}); };
+  // ---- analysis layer (under the plan) ----
   if (O.lines && E && E.n === (APP.rows['4h'] || []).length) {
-    fc.draw.TL.forEach((l) => { const xa = X(l.a), xb = X(n - 1 + 30); g.strokeStyle = l.res ? '#ef5350' : '#26a69a'; g.lineWidth = 1.6; g.beginPath(); g.moveTo(xa, Y(l.at(l.a))); g.lineTo(xb, Y(l.at(n - 1 + 30))); g.stroke(); label((xa + X(l.b)) / 2, Y(l.at(Math.round((l.a + l.b) / 2))) + (l.res ? -10 : 10), (l.res ? 'наклонка сопр.' : 'наклонка подд.') + ' · ' + l.touches + ' кас.', l.res ? '#7a2a2a' : '#1d5e57'); });
     const FB = fc.draw.FB;
     if (FB) {
-      const xa = X(FB.a.i); g.strokeStyle = 'rgba(255,213,79,0.6)'; g.lineWidth = 1; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(xa, Y(FB.a.p)); g.lineTo(X(FB.b.i), Y(FB.b.p)); g.stroke(); g.setLineDash([]);
-      if (FB.up) { g.fillStyle = 'rgba(255,213,79,0.10)'; const y0 = Y(FB.ret(0.618)), y1 = Y(FB.ret(0.786)); g.fillRect(xa, y0, x1 - xa, y1 - y0); }
-      FB.levels.concat([{r: 0, p: FB.up ? FB.hi : FB.lo}, {r: 1, p: FB.up ? FB.lo : FB.hi}]).forEach((lv) => { const y = Y(lv.p); g.strokeStyle = 'rgba(255,213,79,0.35)'; g.beginPath(); g.moveTo(xa, y); g.lineTo(x1, y); g.stroke(); g.fillStyle = 'rgba(255,213,79,0.85)'; g.textAlign = 'left'; g.fillText(lv.r + '  $' + lv.p.toFixed(2), xa + 4, y - 6); });
+      const FC = {0: '#787b86', 0.236: '#f23645', 0.382: '#ff9800', 0.5: '#4caf50', 0.618: '#089981', 0.65: '#089981', 0.786: '#00bcd4', 0.886: '#2962ff', 1: '#787b86'};
+      const xa = X(Math.min(FB.a.i, FB.b.i));
+      g.strokeStyle = 'rgba(180,180,190,0.55)'; g.lineWidth = 1; g.setLineDash([5, 5]); g.beginPath(); g.moveTo(X(FB.a.i), Y(FB.a.p)); g.lineTo(X(FB.b.i), Y(FB.b.p)); g.stroke(); g.setLineDash([]);
+      const gp0 = Y(FB.ret(0.618)), gp1 = Y(FB.ret(0.65)); g.fillStyle = 'rgba(8,153,129,0.12)'; g.fillRect(xa, Math.min(gp0, gp1), X(n - 1 + 4) - xa, Math.abs(gp1 - gp0) + 1);
+      font(10);
+      [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1].forEach((r) => { const p = FB.ret(r), y = Y(p); if (y < 0 || y > PH) return; const col = FC[r]; g.strokeStyle = rgba(col, 0.75); g.lineWidth = 1; g.beginPath(); g.moveTo(xa, y); g.lineTo(X(n - 1 + 4), y); g.stroke(); g.fillStyle = col; const ft = r + ' (' + fp(p) + ')'; if (xa - 4 - g.measureText(ft).width > 2) { g.textAlign = 'right'; g.fillText(ft, xa - 4, y); } else { g.textAlign = 'left'; g.fillText(ft, Math.max(2, xa) + 4, y - 7); } });
     }
+    font(11, '600');
+    fc.draw.TL.forEach((l) => { const xa = X(l.a), xe = n - 1 + 25, col = '#ff9800'; g.strokeStyle = col; g.lineWidth = 1.3; g.beginPath(); g.moveTo(xa, Y(l.at(l.a))); g.lineTo(X(xe), Y(l.at(xe))); g.stroke();
+      const xm = Math.round((l.a + l.b) / 2), ang = Math.atan2(Y(l.at(l.b)) - Y(l.at(l.a)), X(l.b) - X(l.a));
+      g.save(); g.translate(X(xm), Y(l.at(xm)) + (l.res ? -8 : 12)); g.rotate(ang); g.fillStyle = col; g.textAlign = 'center'; g.fillText((l.res ? 'Нисх. линия' : 'Восх. линия') + ' · ' + l.touches + ' кас.', 0, 0); g.restore(); });
     const EW = fc.draw.EW;
-    if (EW) { g.strokeStyle = '#ce93d8'; g.lineWidth = 1.6; g.beginPath(); EW.w.forEach((p, k) => { const x = X(p.i), y = Y(p.p); k ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); EW.w.forEach((p, k) => label(X(p.i), Y(p.p) + (p.hi ? -14 : 14), String(k), '#6a1b9a')); }
+    if (EW) { g.strokeStyle = 'rgba(206,147,216,0.45)'; g.lineWidth = 1; g.setLineDash([4, 4]); g.beginPath(); EW.w.forEach((p, k) => { const x = X(p.i), y = Y(p.p); k ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); g.setLineDash([]); font(11, '700'); EW.w.forEach((p, k) => { if (!k) return; g.fillStyle = '#ce93d8'; g.textAlign = 'center'; g.fillText(String(k), X(p.i), Y(p.p) + (p.hi ? -11 : 11)); }); }
   }
-  const labs = [];
-  const box = (lo, hi, fill, stroke, txt) => { const y0 = Y(hi), y1 = Y(lo); g.fillStyle = fill; g.fillRect(x0, y0, x1 - x0, y1 - y0); g.strokeStyle = stroke; g.lineWidth = 1.2; g.strokeRect(x0, y0, x1 - x0, y1 - y0); g.font = '600 12px system-ui, sans-serif'; g.textAlign = 'left'; const bw = g.measureText(txt).width; g.fillStyle = 'rgba(11,14,20,.85)'; g.fillRect(x0 + 4, (y0 + y1) / 2 - 9, bw + 8, 18); g.fillStyle = stroke; g.fillText(txt, x0 + 8, (y0 + y1) / 2); g.font = '11px system-ui, sans-serif'; };
-  const line = (p, col, txt, dash) => { const y = Y(p); g.strokeStyle = col; g.lineWidth = 1.6; g.setLineDash(dash || []); g.beginPath(); g.moveTo(x0, y); g.lineTo(x1, y); g.stroke(); g.setLineDash([]); labs.push({y, col, txt}); };
-  if (O.entry && !fc.inPos) box(fc.buyLo, fc.buyHi, 'rgba(38,166,154,0.18)', '#26a69a', 'ЗОНА ВХОДА $' + fc.buyLo.toFixed(2) + '–' + fc.buyHi.toFixed(2));
-  if (O.entry && fc.inPos) line(fc.entry, '#29b6f6', 'Вход $' + fc.entry.toFixed(2));
-  if (O.tp) { box(fc.tp1.p, Math.max(fc.tp2.p, fc.tp1.p) * 1.003, 'rgba(239,83,80,0.12)', '#ef5350', 'ЗОНА ФИКСАЦИИ'); line(fc.tp1.p, '#ef5350', 'TP1 $' + fc.tp1.p.toFixed(2), [2, 3]); line(fc.tp2.p, '#ef5350', 'TP2 $' + fc.tp2.p.toFixed(2), [2, 3]); if (fc.tp3) line(fc.tp3.p, '#ef5350', 'TP3 $' + fc.tp3.p.toFixed(2), [2, 3]); }
-  if (O.sl) line(fc.stop, '#ff9800', 'Стоп $' + fc.stop.toFixed(2), [6, 4]);
+  // ---- trade plan ----
+  font(11, '600');
+  const L = '#26a69a', R = '#ef5350', S = '#ff7043', V = '#b388ff';
+  if (O.entry && !fc.inPos) zone(fc.buyLo, fc.buyHi, L, 'LONG вход ' + fp(fc.buyLo) + '–' + fp(fc.buyHi) + (fc.zoneSrc && fc.zoneSrc.length ? ' — ' + fc.zoneSrc.slice(0, 2).join(', ') : ''));
+  if (O.entry && fc.inPos) hl(fc.entry, '#29b6f6', 'LONG вход ' + fp(fc.entry) + ' — позиция открыта', {w: 1.5});
+  const srcTxt = (t) => t && t.src ? ' — ' + (Array.isArray(t.src) ? t.src.slice(0, 2).join(', ') : t.src) : '';
+  if (O.tp) { hl(fc.tp1.p, L, 'LONG TP1 ' + fp(fc.tp1.p) + srcTxt(fc.tp1)); hl(fc.tp2.p, L, 'LONG TP2 ' + fp(fc.tp2.p) + srcTxt(fc.tp2), {a: 0.75}); if (fc.tp3) hl(fc.tp3.p, L, 'LONG TP3 ' + fp(fc.tp3.p) + srcTxt(fc.tp3), {a: 0.6}); }
+  if (O.sl) hl(fc.stop, R, 'LONG SL ' + fp(fc.stop) + (fc.stopSrc ? ' — ' + fc.stopSrc : '') + (O.down && Math.abs(fc.dnTrig - fc.stop) < 1e-9 ? ' · закрытие 4H ниже = слом' : ''), {dash: [6, 4]});
   if (O.down) {
-    if (fc.shortPlan) { const sp = fc.shortPlan; box(sp.sLo, sp.sHi, 'rgba(255,112,67,0.18)', '#ff7043', 'ЗОНА ШОРТА'); line(sp.sStop, '#ff9800', 'Стоп шорта $' + sp.sStop.toFixed(2), [6, 4]); }
-    line(fc.dnTrig, '#b388ff', 'Слом роста: закрытие 4H ниже $' + fc.dnTrig.toFixed(2), [8, 4]);
-    line(fc.dn1.p, '#b388ff', 'Вниз 1 $' + fc.dn1.p.toFixed(2), [2, 3]); line(fc.dn2.p, '#b388ff', 'Вниз 2 $' + fc.dn2.p.toFixed(2), [2, 3]);
+    if (fc.shortPlan) { const sp = fc.shortPlan; zone(sp.sLo, sp.sHi, S, 'SHORT вход ' + fp(sp.sLo) + '–' + fp(sp.sHi) + (sp.src ? ' — ' + sp.src : '')); hl(sp.sStop, S, 'SHORT SL ' + fp(sp.sStop), {dash: [6, 4]}); }
+    if (Math.abs(fc.dnTrig - fc.stop) > 1e-9 || !O.sl) hl(fc.dnTrig, V, 'Слом: закрытие 4H ниже ' + fp(fc.dnTrig), {dash: [8, 4]});
+    hl(fc.dn1.p, V, (fc.shortPlan ? 'SHORT TP1 ' : 'Вниз 1 ') + fp(fc.dn1.p) + srcTxt(fc.dn1), {dash: [2, 3]});
+    hl(fc.dn2.p, V, (fc.shortPlan ? 'SHORT TP2 ' : 'Вниз 2 ') + fp(fc.dn2.p) + srcTxt(fc.dn2), {dash: [2, 3], a: 0.7});
   }
+  // projected path: from the last candle to the entry and on to TP1 (and the downside if shown)
+  const xn = X(n - 1), yn = Y(fc.c), xp = Math.min(PW - 40, xn + (PW - xn) * 0.35), xq = Math.min(PW - 10, xn + (PW - xn) * 0.7);
+  const path = (pts, col) => { g.strokeStyle = col; g.lineWidth = 1.6; g.setLineDash([5, 4]); g.beginPath(); g.moveTo(xn, yn); pts.forEach(([x, y]) => g.lineTo(x, y)); g.stroke(); g.setLineDash([]); const [lx, ly] = pts[pts.length - 1]; g.fillStyle = col; g.beginPath(); g.arc(lx, ly, 3.5, 0, 7); g.fill(); };
+  if (fc.inPos || (fc.c >= fc.buyLo && fc.c <= fc.buyHi)) path([[xq, Y(fc.tp1.p)]], L); else path([[xp, Y((fc.buyLo + fc.buyHi) / 2)], [xq, Y(fc.tp1.p)]], L);
+  if (O.down && fc.shortPlan) path([[xp, Y((fc.shortPlan.sLo + fc.shortPlan.sHi) / 2)], [xq, Y(fc.dn1.p)]], V); else if (O.down) path([[xq, Y(fc.dn1.p)]], V);
+  // right-edge labels: above their line, de-collided
+  font(11, '600');
   labs.sort((a, b) => a.y - b.y); let prev = -Infinity;
-  labs.forEach((l) => { l.ly = Math.max(l.y, prev + 19); prev = l.ly; });
-  labs.forEach((l) => { const tw = g.measureText(l.txt).width; g.fillStyle = 'rgba(11,14,20,0.92)'; g.fillRect(x1 - tw - 18, l.ly - 9, tw + 12, 18); g.fillStyle = l.col; g.textAlign = 'left'; g.fillText(l.txt, x1 - tw - 12, l.ly); if (Math.abs(l.ly - l.y) > 2) { g.strokeStyle = l.col; g.lineWidth = 1; g.beginPath(); g.moveTo(x1 - tw - 18, l.ly); g.lineTo(x1 - tw - 30, l.y); g.stroke(); } });
-  const xn = X(n - 1), yn = Y(fc.c);
-  const arrow = (ty, col, dash) => { g.strokeStyle = col; g.lineWidth = 2; g.setLineDash(dash || []); g.beginPath(); g.moveTo(xn + 6, yn); g.lineTo(xn + 60, ty); g.stroke(); g.setLineDash([]); g.beginPath(); g.arc(xn + 60, ty, 4, 0, 7); g.fillStyle = col; g.fill(); };
-  arrow(fc.inPos || fc.c <= fc.buyHi ? Y(fc.tp1.p) : Y((fc.buyLo + fc.buyHi) / 2), fc.inPos ? '#26a69a' : '#ffd54f');
-  if (O.down) arrow(Y(fc.dn1.p), '#b388ff', [5, 4]);
+  labs.forEach((l) => { l.ly = Math.max(l.y - 8, prev + 14); prev = l.ly; });
+  if (PW < 640) labs.forEach((l) => { l.txt = l.txt.split(' — ')[0].split(' · ')[0]; });
+  labs.forEach((l) => { const tw = g.measureText(l.txt).width, x = PW - 8; g.fillStyle = 'rgba(11,14,20,0.72)'; g.fillRect(x - tw - 4, l.ly - 7, tw + 8, 14); g.fillStyle = l.col; g.textAlign = 'right'; g.fillText(l.txt, x, l.ly); });
+  g.textAlign = 'left';
 };
 
 async function runForecast() {
