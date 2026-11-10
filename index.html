@@ -1,0 +1,737 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>HYPE live</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#0b0e14;--fg:#d1d4dc;--mut:#787b86;--line:#2a2e39}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif}
+.bar{display:flex;gap:6px;align-items:center;padding:8px 10px;position:sticky;top:0;background:var(--bg);z-index:2;border-bottom:1px solid var(--line);flex-wrap:wrap}
+button{background:#1e222d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font-size:14px}
+button.on{background:#2962ff;border-color:#2962ff;color:#fff}#st{margin-left:auto;color:var(--mut);font-size:12px}
+#chart{width:100%;touch-action:none;user-select:none;overflow:hidden}#chart svg{display:block}
+#plan{padding:10px 12px 40px;font-size:13.5px}#plan b{color:#fff}
+</style></head><body>
+<div class="bar"><button class="tf" data-tf="5m">5m</button><button class="tf" data-tf="15m">15m</button><button class="tf" data-tf="1h">1H</button><button class="tf" data-tf="4h">4H</button>
+<button id="zin">＋</button><button id="zout">－</button><button id="now">⇥</button><span id="st">…</span></div>
+<div id="chart"></div><div id="plan">Загружаю…</div>
+<script>window.hxTF = {
+  '5m': {ids: ['h_5m_a', 'h_5m_b', 'h_5m_c'], ft: '%d.%m %H:%M', fa: '%H:%M'},
+  '15m': {ids: ['h_15m'], ft: '%d.%m %H:%M', fa: '%d.%m %H:%M'},
+  '1h': {ids: ['h_1h'], ft: '%d.%m.%y %H:%M', fa: '%d.%m'},
+  '4h': {ids: ['h_4h'], ft: '%d.%m.%y %H:%M', fa: '%d.%m'},
+  '1d': {ids: ['h_1d'], ft: '%d.%m.%Y', fa: '%d.%m.%y'},
+  '1w': {ids: ['h_1w'], ft: '%d.%m.%Y', fa: '%m.%y'},
+  '1M': {ids: ['h_1M'], ft: '%m.%Y', fa: '%m.%Y'}
+};
+window.hxHeat = window.hxHeat || {tf: '4h', min: 0.25};
+window.hxUSD = (v) => v >= 1e6 ? '$' + (v / 1e6).toFixed(v >= 1e7 ? 1 : 2) + ' млн' : v >= 1e3 ? '$' + Math.round(v / 1e3) + ' тыс.' : '$' + Math.round(v);
+
+// Liquidation model: every rise in open interest opens positions split half long / half short
+// over leverage tiers; a level is removed when price trades through it and shrinks when OI falls.
+window.hxEngine = (rows) => {
+  const n = rows.length, T = new Float64Array(n), O = new Float64Array(n), Hh = new Float64Array(n), Lw = new Float64Array(n), C = new Float64Array(n), OI = new Float64Array(n);
+  rows.forEach((r, i) => { if (Array.isArray(r)) { T[i] = r[0]; O[i] = r[1]; Hh[i] = r[2]; Lw[i] = r[3]; C[i] = r[4]; OI[i] = r[5] == null ? NaN : r[5]; } else { T[i] = Number(r.t) * 1000; O[i] = Number(r.o); Hh[i] = Number(r.h); Lw[i] = Number(r.l); C[i] = Number(r.c); OI[i] = r.oi === '' ? NaN : Number(r.oi); } });
+  let mn = Infinity, mx = 0; for (let i = 0; i < n; i++) { if (Lw[i] < mn) mn = Lw[i]; if (Hh[i] > mx) mx = Hh[i]; }
+  const pmin = mn * 0.75, pmax = mx * 1.3, STEP = Math.log(1.0035), NB = Math.ceil(Math.log(pmax / pmin) / STEP);
+  const lp0 = Math.log(pmin);
+  const binOf = (p) => Math.max(0, Math.min(NB - 1, Math.floor((Math.log(p) - lp0) / STEP)));
+  const price = (k) => Math.exp(lp0 + (k + 0.5) * STEP);
+  const tiers = [[10, .25], [25, .3], [50, .3], [100, .15]], MM = 0.005, CP = 1024;
+  const fresh = () => ({L: new Float64Array(NB), S: new Float64Array(NB), f: 1, prev: NaN, lmax: -1, smin: NB, i: -1});
+  const copy = (s) => ({L: s.L.slice(), S: s.S.slice(), f: s.f, prev: s.prev, lmax: s.lmax, smin: s.smin, i: s.i});
+  const step = (s, i) => {
+    const kl = binOf(Lw[i]);
+    for (let k = Math.max(kl, 0); k <= s.lmax; k++) s.L[k] = 0;
+    if (s.lmax >= kl) s.lmax = kl - 1;
+    const kh = binOf(Hh[i]);
+    for (let k = s.smin; k <= kh && k < NB; k++) s.S[k] = 0;
+    if (s.smin <= kh) s.smin = kh + 1;
+    const oi = OI[i];
+    if (!isNaN(oi)) {
+      if (!isNaN(s.prev) && s.prev > 0) {
+        const d = oi - s.prev;
+        if (d > 0) {
+          const tp = (O[i] + Hh[i] + Lw[i] + C[i]) / 4, usd = d * tp * 0.5 / s.f;
+          for (const [lev, w] of tiers) {
+            const kL = binOf(tp * (1 - 1 / lev + MM)), kS = binOf(tp * (1 + 1 / lev - MM));
+            if (kL < kl) { s.L[kL] += usd * w; if (kL > s.lmax) s.lmax = kL; }
+            if (kS > kh) { s.S[kS] += usd * w; if (kS < s.smin) s.smin = kS; }
+          }
+        } else if (d < 0) {
+          s.f *= 1 + d / s.prev;
+          if (s.f < 1e-6) { for (let k = 0; k < NB; k++) { s.L[k] *= s.f; s.S[k] *= s.f; } s.f = 1; }
+        }
+      }
+      s.prev = oi;
+    }
+    s.i = i;
+  };
+  const cps = []; const s0 = fresh();
+  for (let i = 0; i < n; i++) { step(s0, i); if (i % CP === CP - 1 || i === n - 1) cps.push(copy(s0)); }
+  const lastSnap = (() => { const v = new Float32Array(NB * 2); for (let k = 0; k < NB; k++) { v[k] = s0.L[k] * s0.f; v[NB + k] = s0.S[k] * s0.f; } return v; })();
+  const cache = new Map();
+  // snapshots at sorted bar indices; replays from the nearest checkpoint
+  const snaps = (idx) => {
+    const out = new Array(idx.length); const miss = [];
+    idx.forEach((i, j) => { const c = cache.get(i); if (c) out[j] = c; else miss.push(j); });
+    if (miss.length) {
+      if (cache.size > 6000) cache.clear();
+      let s = null;
+      for (const j of miss) {
+        const i = idx[j];
+        if (!s || s.i > i || Math.floor(i / CP) - Math.floor(Math.max(s.i, 0) / CP) > 1) {
+          const ci = Math.floor((i + 1) / CP) - 1;
+          s = ci >= 0 ? copy(cps[ci]) : fresh();
+        }
+        while (s.i < i) step(s, s.i + 1);
+        const v = new Float32Array(NB * 2); for (let k = 0; k < NB; k++) { v[k] = s.L[k] * s.f; v[NB + k] = s.S[k] * s.f; }
+        cache.set(i, v); out[j] = v;
+      }
+    }
+    return out;
+  };
+  return {n, T, O, H: Hh, L: Lw, C, NB, price, binOf, STEP, snaps, last: lastSnap};
+};
+
+window.hxZones = (eng, snap, minFrac) => {
+  const NB = eng.NB; let mx = 0;
+  for (let k = 0; k < 2 * NB; k++) if (snap[k] > mx) mx = snap[k];
+  const thr = mx * minFrac, zones = [];
+  for (const side of [0, 1]) {
+    let z = null;
+    for (let k = 0; k < NB; k++) {
+      const v = snap[side * NB + k];
+      if (v >= thr && v > 0) { if (z && z.k1 === k - 1) { z.k1 = k; z.v += v; } else { z = {side, k0: k, k1: k, v}; zones.push(z); } }
+    }
+  }
+  return zones;
+};
+
+window.dash={data:()=>({status:'none',data:[]})};
+// Chart analysis computed from the candles of the selected timeframe.
+window.hxAnalyze = (E) => {
+  if (E.an) return E.an;
+  const n = E.n, O = E.O, H = E.H, L = E.L, C = E.C;
+  const ema = (p) => { const k = 2 / (p + 1), o = new Float64Array(n); o[0] = C[0]; for (let i = 1; i < n; i++) o[i] = C[i] * k + o[i - 1] * (1 - k); return o; };
+  const e50 = ema(50), e200 = ema(200);
+  const rsi = new Float64Array(n).fill(NaN); {
+    let g = 0, l = 0; const P = 14;
+    for (let i = 1; i < n; i++) {
+      const d = C[i] - C[i - 1];
+      if (i <= P) { g += Math.max(d, 0); l += Math.max(-d, 0); if (i === P) { g /= P; l /= P; rsi[i] = 100 - 100 / (1 + g / (l || 1e-9)); } }
+      else { g = (g * (P - 1) + Math.max(d, 0)) / P; l = (l * (P - 1) + Math.max(-d, 0)) / P; rsi[i] = 100 - 100 / (1 + g / (l || 1e-9)); }
+    }
+  }
+  const atr = new Float64Array(n); { let a = 0; for (let i = 0; i < n; i++) { const tr = i ? Math.max(H[i] - L[i], Math.abs(H[i] - C[i - 1]), Math.abs(L[i] - C[i - 1])) : H[i] - L[i]; a = i < 14 ? (a * i + tr) / (i + 1) : (a * 13 + tr) / 14; atr[i] = a; } }
+  const piv = (W) => {
+    const hi = [], lo = [];
+    for (let i = W; i < n - W; i++) {
+      let h = true, l = true;
+      for (let k = 1; k <= W && (h || l); k++) { if (H[i] < H[i - k] || H[i] < H[i + k]) h = false; if (L[i] > L[i - k] || L[i] > L[i + k]) l = false; }
+      if (h) hi.push(i); if (l) lo.push(i);
+    }
+    return {hi, lo};
+  };
+  // market structure: HH/HL/LH/LL and breaks (BOS continues the trend, CHoCH flips it)
+  const P5 = piv(5), labels = [], breaks = [];
+  P5.hi.forEach((i, k) => { if (k) labels.push({i, p: H[i], up: true, t: H[i] > H[P5.hi[k - 1]] ? 'HH' : 'LH'}); });
+  P5.lo.forEach((i, k) => { if (k) labels.push({i, p: L[i], up: false, t: L[i] > L[P5.lo[k - 1]] ? 'HL' : 'LL'}); });
+  {
+    let trend = 0, hp = 0, lp = 0; const W = 5;
+    for (let i = 0; i < n; i++) {
+      while (hp < P5.hi.length && P5.hi[hp] + W <= i) hp++;
+      while (lp < P5.lo.length && P5.lo[lp] + W <= i) lp++;
+      const sh = hp ? P5.hi[hp - 1] : -1, sl = lp ? P5.lo[lp - 1] : -1;
+      if (sh >= 0 && C[i] > H[sh] && C[i - 1] <= H[sh] && !(breaks.length && breaks[breaks.length - 1].from === sh)) { breaks.push({i, from: sh, p: H[sh], up: true, t: trend === -1 ? 'CHoCH' : 'BOS'}); trend = 1; }
+      if (sl >= 0 && C[i] < L[sl] && C[i - 1] >= L[sl] && !(breaks.length && breaks[breaks.length - 1].from === sl)) { breaks.push({i, from: sl, p: L[sl], up: false, t: trend === 1 ? 'CHoCH' : 'BOS'}); trend = -1; }
+    }
+  }
+  // RSI divergences between neighbouring 3-bar pivots
+  const P3 = piv(3), divs = [];
+  for (let k = 1; k < P3.lo.length; k++) {
+    const a = P3.lo[k - 1], b = P3.lo[k]; if (b - a < 5 || b - a > 60 || isNaN(rsi[a])) continue;
+    if (L[b] < L[a] && rsi[b] > rsi[a] && rsi[a] < 40) divs.push({a, b, pa: L[a], pb: L[b], up: true, hidden: false});
+    else if (L[b] > L[a] && rsi[b] < rsi[a]) divs.push({a, b, pa: L[a], pb: L[b], up: true, hidden: true});
+  }
+  for (let k = 1; k < P3.hi.length; k++) {
+    const a = P3.hi[k - 1], b = P3.hi[k]; if (b - a < 5 || b - a > 60 || isNaN(rsi[a])) continue;
+    if (H[b] > H[a] && rsi[b] < rsi[a] && rsi[a] > 60) divs.push({a, b, pa: H[a], pb: H[b], up: false, hidden: false});
+    else if (H[b] < H[a] && rsi[b] > rsi[a]) divs.push({a, b, pa: H[a], pb: H[b], up: false, hidden: true});
+  }
+  divs.sort((x, y) => x.b - y.b);
+  // fair value gaps, alive until price trades through them
+  const fvg = [];
+  for (let i = 2; i < n; i++) {
+    if (L[i] > H[i - 2] && (L[i] / H[i - 2] - 1) >= 0.003) fvg.push({i, lo: H[i - 2], hi: L[i], up: true, end: n});
+    if (H[i] < L[i - 2] && (L[i - 2] / H[i] - 1) >= 0.003) fvg.push({i, lo: H[i], hi: L[i - 2], up: false, end: n});
+  }
+  fvg.forEach((f) => { for (let j = f.i + 1; j < n; j++) { if (f.up ? L[j] <= f.lo : H[j] >= f.hi) { f.end = j; break; } } });
+  // figures: double tops/bottoms confirmed by a close through the neckline, and ranges
+  const figs = [];
+  const dbl = (arr, top) => {
+    for (let k = 1; k < arr.length; k++) {
+      const a = arr[k - 1], b = arr[k], pa = top ? H[a] : L[a], pb = top ? H[b] : L[b];
+      if (b - a < 8 || Math.abs(pb / pa - 1) > 0.015) continue;
+      let m = a, mv = top ? Infinity : -Infinity;
+      for (let i = a; i <= b; i++) { if (top ? L[i] < mv : H[i] > mv) { mv = top ? L[i] : H[i]; m = i; } }
+      const depth = top ? 1 - mv / Math.min(pa, pb) : mv / Math.max(pa, pb) - 1;
+      if (depth < Math.max(0.03, 2 * atr[b] / C[b])) continue;
+      for (let j = b + 1; j < Math.min(n, b + 3 * (b - a)); j++) {
+        if (top ? C[j] < mv : C[j] > mv) { figs.push({kind: top ? 'Двойная вершина' : 'Двойное дно', a, m, b, j, pa, pb, neck: mv, top}); break; }
+        if (top ? H[j] > Math.max(pa, pb) * 1.01 : L[j] < Math.min(pa, pb) * 0.99) break;
+      }
+    }
+  };
+  dbl(P5.hi, true); dbl(P5.lo, false);
+  const ranges = []; {
+    const N = 30; let i = N;
+    while (i < n - 1) {
+      let hi = -Infinity, lo = Infinity; for (let k = i - N; k < i; k++) { if (H[k] > hi) hi = H[k]; if (L[k] < lo) lo = L[k]; }
+      if (hi / lo - 1 <= 0.12 && hi / lo - 1 >= 0.01) {
+        let j = i; while (j < n && C[j] <= hi && C[j] >= lo) j++;
+        ranges.push({a: i - N, b: Math.min(j, n - 1), lo, hi, up: j < n ? C[j] > hi : null}); i = j + N;
+      } else i++;
+    }
+  }
+  E.an = {e50, e200, rsi, atr, labels, breaks, divs, fvg, figs, ranges};
+  return E.an;
+};
+
+// Similar situations: the closest past windows to the latest price path, and what followed.
+window.hxAnalogs = (E, W = 40, F = 20, K = 5) => {
+  if (E.ana) return E.ana;
+  const n = E.n, C = E.C; if (n < W * 3 + F) return (E.ana = null);
+  const lc = new Float64Array(n); for (let i = 0; i < n; i++) lc[i] = Math.log(C[i]);
+  const norm = (s) => { let m = 0; for (let k = 0; k < W; k++) m += lc[s + k]; m /= W; let v = 0; for (let k = 0; k < W; k++) v += (lc[s + k] - m) ** 2; return {m, sd: Math.sqrt(v / W) || 1e-9}; };
+  const q = n - W, qn = norm(q), qz = new Float64Array(W); for (let k = 0; k < W; k++) qz[k] = (lc[q + k] - qn.m) / qn.sd;
+  const cand = [];
+  for (let s = 0; s + W + F <= q - W; s++) {
+    let sx = 0, sxx = 0, sxy = 0; for (let k = 0; k < W; k++) { const x = lc[s + k]; sx += x; sxx += x * x; sxy += x * qz[k]; }
+    const m = sx / W, sd = Math.sqrt(Math.max(sxx / W - m * m, 1e-18)); cand.push({s, r: (sxy / W) / sd});
+  }
+  cand.sort((a, b) => b.r - a.r);
+  const pick = []; for (const c of cand) { if (pick.every((p) => Math.abs(p.s - c.s) >= W)) pick.push(c); if (pick.length === K) break; }
+  const paths = pick.map((p) => { const base = C[p.s + W - 1], out = []; for (let f = 1; f <= F; f++) out.push(C[p.s + W - 1 + f] / base - 1); return out; });
+  const med = [], lo = [], hi = [];
+  for (let f = 0; f < F; f++) { const v = paths.map((x) => x[f]).sort((a, b) => a - b); med.push(v[Math.floor(v.length / 2)]); lo.push(v[0]); hi.push(v[v.length - 1]); }
+  E.ana = {W, F, pick, paths, med, lo, hi, up: paths.filter((x) => x[F - 1] > 0).length};
+  return E.ana;
+};
+
+window.hxTrades = () => {
+  const d = dash.data('strat_trades'); if (d.status !== 'ok') return [];
+  return d.data.map((r) => ({et: Number(r.entry_t) * 1000, xt: Number(r.exit_t) * 1000, ep: Number(r.entry_p), xp: Number(r.exit_p), ret: Number(r.ret), open: r.status === 'открыта'}));
+};
+window.hxIdxAt = (E, t) => { let lo = 0, hi = E.n - 1; while (lo < hi) { const m = (lo + hi + 1) >> 1; if (E.T[m] <= t) lo = m; else hi = m - 1; } return lo; };
+
+// Auto trendlines: connect 5-bar pivots of the same type; a line is valid while no candle closes through it.
+window.hxTrendlines = (E, A, W = 5) => {
+  if (E.tl) return E.tl;
+  const n = E.n, H = E.H, L = E.L, C = E.C, atr = A.atr;
+  const lh = Array.from(H, Math.log), ll = Array.from(L, Math.log), lc = Array.from(C, Math.log);
+  const piv = (hi) => { const o = []; for (let i = W; i < n - W; i++) { let ok = true; for (let k = 1; k <= W && ok; k++) { if (hi ? (H[i] < H[i - k] || H[i] < H[i + k]) : (L[i] > L[i - k] || L[i] > L[i + k])) ok = false; } if (ok) o.push(i); } return o; };
+  const lines = [];
+  for (const res of [true, false]) {
+    const P = piv(res), lv = res ? lh : ll;
+    for (let q = 1; q < P.length; q++) {
+      const b = P[q]; let best = null;
+      for (let p = q - 1; p >= 0 && b - P[p] <= 200; p--) {
+        const a = P[p]; if (b - a < 8) continue;
+        if (res ? !(H[a] > H[b]) : !(L[a] < L[b])) continue;
+        const sl = (lv[b] - lv[a]) / (b - a), at = (i) => lv[a] + sl * (i - a);
+        const tol = (i) => 0.25 * atr[i] / C[i];
+        let ok = true, touches = 2;
+        for (let i = a + 1; i < b && ok; i++) { if (res ? lc[i] > at(i) + tol(i) : lc[i] < at(i) - tol(i)) ok = false; }
+        if (!ok) continue;
+        for (let r = p + 1; r < q; r++) { const k = P[r]; if (Math.abs(lv[k] - at(k)) <= tol(k)) touches++; }
+        if (!best || touches > best.touches || (touches === best.touches && a < best.a)) best = {a, b, sl, base: lv[a], touches};
+      }
+      if (!best) continue;
+      const at = (i) => best.base + best.sl * (i - best.a), tol = (i) => 0.25 * atr[i] / C[i];
+      let brk = null; const after = [];
+      for (let i = best.b + W + 1; i < n; i++) {
+        if (res ? lc[i] > at(i) + tol(i) : lc[i] < at(i) - tol(i)) { brk = i; break; }
+        if (res ? lh[i] >= at(i) - tol(i) : ll[i] <= at(i) + tol(i)) after.push(i);
+      }
+      lines.push({res, a: best.a, b: best.b, base: best.base, sl: best.sl, touches: best.touches, brk, after, conf: best.b + W});
+    }
+  }
+  // drop near-duplicates: keep the line with more touches among lines sharing an anchor
+  const keep = [];
+  lines.sort((x, y) => y.touches - x.touches || (x.b - x.a) - (y.b - y.a)).forEach((l) => { if (!keep.some((k) => k.res === l.res && (k.a === l.a || k.b === l.b))) keep.push(l); });
+  keep.forEach((l) => { l.at = (i) => Math.exp(l.base + l.sl * (i - l.a)); });
+  E.tl = keep.sort((x, y) => x.b - y.b);
+  return E.tl;
+};
+
+'use strict';
+// Swing legs with an adaptive threshold, Fibonacci levels of the last leg, and an Elliott impulse count that obeys the three hard rules.
+window.hxZigzag = (E, A) => {
+  if (E.zz) return E.zz;
+  const n = E.n, H = E.H, L = E.L, C = E.C;
+  const pct = [...A.atr].slice(-500).map((a, k, arr) => a / C[n - arr.length + k]).sort((x, y) => x - y);
+  const th = Math.max(0.03, 3 * pct[pct.length >> 1]);
+  const pv = []; let dir = 0, hi = H[0], hiI = 0, lo = L[0], loI = 0, ext = 0, ei = 0;
+  for (let i = 1; i < n; i++) {
+    if (dir === 0) {
+      if (H[i] > hi) { hi = H[i]; hiI = i; } if (L[i] < lo) { lo = L[i]; loI = i; }
+      if (L[i] <= hi * (1 - th) && hiI < i) { pv.push({i: hiI, p: hi, hi: true}); dir = -1; ext = L[i]; ei = i; }
+      else if (H[i] >= lo * (1 + th) && loI < i) { pv.push({i: loI, p: lo, hi: false}); dir = 1; ext = H[i]; ei = i; }
+    } else if (dir === 1) {
+      if (H[i] >= ext) { ext = H[i]; ei = i; }
+      else if (L[i] <= ext * (1 - th)) { pv.push({i: ei, p: ext, hi: true}); dir = -1; ext = L[i]; ei = i; }
+    } else {
+      if (L[i] <= ext) { ext = L[i]; ei = i; }
+      else if (H[i] >= ext * (1 + th)) { pv.push({i: ei, p: ext, hi: false}); dir = 1; ext = H[i]; ei = i; }
+    }
+  }
+  // the running extreme is the latest, still unconfirmed, pivot
+  const tail = dir === 1 ? {i: ei, p: ext, hi: true, open: true} : dir === -1 ? {i: ei, p: ext, hi: false, open: true} : null;
+  E.zz = {pv, tail, th};
+  return E.zz;
+};
+window.hxFib = (E, zz) => {
+  const pts = [...zz.pv, zz.tail].filter(Boolean); if (pts.length < 3) return null;
+  const p1 = pts[pts.length - 3], p2 = pts[pts.length - 2], p3 = pts[pts.length - 1];
+  // measure the last impulse: if the latest leg is a pullback that has not broken the impulse start, measure the leg before it
+  let a, b, pull = null;
+  if (p3.hi !== p2.hi && (p3.hi ? p3.p < p1.p : p3.p > p1.p)) { a = p1; b = p2; pull = p3; }
+  else { a = p2; b = p3; }
+  const up = !a.hi; const lo = Math.min(a.p, b.p), hi = Math.max(a.p, b.p), R = hi - lo;
+  const ret = (r) => up ? hi - r * R : lo + r * R, ext = (r) => up ? lo + r * R : hi - r * R;
+  const depth = pull ? Math.abs(b.p - pull.p) / R : null;
+  return {up, a, b, pull, depth, lo, hi, R, ret, ext, levels: [0.382, 0.5, 0.618, 0.65, 0.786, 0.886].map((r) => ({r, p: ret(r)})), exts: [1.272, 1.618].map((r) => ({r, p: ext(r)}))};
+};
+window.hxElliott = (E, zz) => {
+  const P = [...zz.pv, zz.tail].filter(Boolean);
+  const valid = (w, up) => {
+    const s = up ? 1 : -1, len = (x, y) => s * (y.p - x.p);
+    const L1 = len(w[0], w[1]); if (L1 <= 0) return false;
+    if (w.length > 2 && !(s * (w[2].p - w[0].p) > 0)) return false;
+    if (w.length > 3) { const L3 = len(w[2], w[3]); if (L3 <= 0) return false; if (w.length > 5) { const L5 = len(w[4], w[5]); if (L3 < L1 && L3 < L5) return false; } }
+    if (w.length > 4 && !(s * (w[4].p - w[1].p) > 0)) return false;
+    return true;
+  };
+  // try the longest valid count that ends at the latest pivot: 0..5, 0..4, 0..3, 0..2
+  for (const m of [6, 5, 4, 3]) {
+    if (P.length < m) continue;
+    const w = P.slice(-m), up = !w[0].hi;
+    if (w.some((x, k) => k && x.hi === w[k - 1].hi)) continue;
+    if (!valid(w, up)) continue;
+    const s = up ? 1 : -1, L1 = Math.abs(w[1].p - w[0].p);
+    const out = {up, w, stage: m - 1};
+    if (m === 3) { const L2end = w[2].p; out.next = 'волна 3'; out.t1 = L2end + s * 1.618 * L1; out.t2 = L2end + s * 1.0 * L1; out.inval = w[0].p; }
+    if (m === 4) { const L3 = Math.abs(w[3].p - w[2].p); out.next = 'волна 4 (откат)'; out.zLo = w[3].p - s * 0.5 * L3; out.zHi = w[3].p - s * 0.382 * L3; out.inval = w[1].p; }
+    if (m === 5) { const span = Math.abs(w[3].p - w[0].p); out.next = 'волна 5'; out.t1 = w[4].p + s * L1; out.t2 = w[4].p + s * 0.618 * span; out.inval = w[1].p; }
+    if (m === 6) { const span = Math.abs(w[5].p - w[0].p); out.next = 'коррекция ABC после пяти волн'; out.zLo = w[5].p - s * 0.5 * span; out.zHi = w[5].p - s * 0.382 * span; out.inval = null; }
+    return out;
+  }
+  return null;
+};
+</script>
+<script>(function(){'use strict';
+// Chart snapshot for Telegram: candles + FVG + Fibonacci + trendlines (triangle) + levels + liquidation clusters + long/short position boxes.
+// Draws SVG and converts to PNG with resvg (bundled in node_modules, no install needed).
+let Resvg = null; try { Resvg = require('@resvg/resvg-js').Resvg; } catch (e) {}
+let W = 1400, H = 820, PL = 8, PR = 1290, PT = 58, PB = 760;
+const COL = {bg: '#0b0e14', grid: '#1c212b', txt: '#d1d4dc', mut: '#787b86', up: '#26a69a', dn: '#ef5350', e50: '#29b6f6', e200: '#ffb74d', fib: '#ffd54f', res: '#ef5350', sup: '#26a69a', liqS: '#ff6b81', liqL: '#4cd6a8'};
+const x2 = (v) => Math.round(v * 10) / 10;
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const fp = (p) => p >= 100 ? p.toFixed(1) : p.toFixed(p >= 10 ? 2 : 3);
+
+function render(o) {
+  W = o.W || 1400; H = o.H || 820; PR = W - (o.axisW || 110); PB = H - 60;
+  // o: {rows, E, A, tf, title, sub, plans:[{dir,entry,stop,tp1,tp2,pref,now}], zones:{sup,res}, zs, scale, price, tz}
+  const rows = o.rows, n = o.end || rows.length, show = Math.min(n, o.bars || 150), i0 = n - show, pad = 46, A = o.A, E = o.E, px = o.price;
+  const span = show + pad, cw = (PR - PL) / span, X = (i) => PL + (i - i0 + 0.5) * cw;
+  let lo = Infinity, hi = -Infinity; for (let i = i0; i < n; i++) { lo = Math.min(lo, rows[i][3]); hi = Math.max(hi, rows[i][2]); }
+  const rng = hi - lo, inc = (p, k = 0.6) => { if (p > 0 && p > lo - rng * k && p < hi + rng * k) { lo = Math.min(lo, p); hi = Math.max(hi, p); } };
+  (o.plans || []).forEach((p) => [p.entry, p.stop, p.tp1, p.tp2].forEach((v) => inc(v)));
+  const padY = (hi - lo) * 0.06; lo -= padY; hi += padY;
+  const Y = (p) => PT + (hi - p) / (hi - lo) * (PB - PT), inY = (p) => p > lo && p < hi;
+  const s = [];
+  s.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="Segoe UI, Arial, DejaVu Sans, sans-serif">`);
+  s.push(`<rect width="${W}" height="${H}" fill="${COL.bg}"/>`);
+  s.push(`<defs><clipPath id="c"><rect x="${PL}" y="${PT}" width="${PR - PL}" height="${PB - PT}"/></clipPath></defs>`);
+  // grid + price axis
+  const step = (() => { const r = (hi - lo) / 9, m = Math.pow(10, Math.floor(Math.log10(r))); return [1, 2, 2.5, 5, 10].map((k) => k * m).find((k) => k >= r); })();
+  for (let p = Math.ceil(lo / step) * step; p < hi; p += step) { const y = x2(Y(p)); s.push(`<line x1="${PL}" x2="${PR}" y1="${y}" y2="${y}" stroke="${COL.grid}"/><text x="${PR + 8}" y="${y + 4}" fill="${COL.mut}" font-size="12">${fp(p)}</text>`); }
+  const tStep = Math.max(1, Math.round(show / 7));
+  for (let i = n - 1; i >= i0; i -= tStep) { const x = x2(X(i)); const d = new Date(rows[i][0] + 3 * 3600e3); const lab = o.tf === '4h' || o.tf === '1h' ? String(d.getUTCDate()).padStart(2, '0') + '.' + String(d.getUTCMonth() + 1).padStart(2, '0') + (o.tf === '1h' ? ' ' + String(d.getUTCHours()).padStart(2, '0') + ':00' : '') : String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0'); s.push(`<line x1="${x}" x2="${x}" y1="${PT}" y2="${PB}" stroke="${COL.grid}"/><text x="${x}" y="${PB + 18}" fill="${COL.mut}" font-size="12" text-anchor="middle">${lab}</text>`); }
+  s.push('<g clip-path="url(#c)">');
+  const labels = [];
+  const lab = (x, y, t, col, anchor = 'start', size = 12, bold = false) => labels.push({x, y, t, col, anchor, size, bold});
+  // FVG (unfilled, nearest to price)
+  (A.fvg || []).filter((f) => f.end >= n - 1 && f.i >= i0 - 300 && f.hi - f.lo <= 2.5 * (A.atr[n - 2] || Infinity)).sort((a, b) => Math.abs((a.lo + a.hi) / 2 - px) - Math.abs((b.lo + b.hi) / 2 - px)).slice(0, 4).forEach((f) => {
+    if (!inY(f.lo) && !inY(f.hi)) return; const xa = Math.max(PL, X(f.i - 1)), y1 = Y(f.hi), y2 = Y(f.lo);
+    s.push(`<rect x="${x2(xa)}" y="${x2(y1)}" width="${x2(PR - xa)}" height="${x2(Math.max(2, y2 - y1))}" fill="${f.up ? COL.up : COL.dn}" fill-opacity="0.16" stroke="${f.up ? COL.up : COL.dn}" stroke-opacity="0.5" stroke-dasharray="4 3"/>`);
+    lab(xa + 6, (y1 + y2) / 2 + 4, (f.up ? 'Bull FVG ' : 'Bear FVG ') + fp(f.lo) + '–' + fp(f.hi), f.up ? COL.up : COL.dn, 'start', 12, true);
+  });
+  // Fibonacci on the last impulse
+  try {
+    const zz = globalThis.hxZigzag(E, A), F = globalThis.hxFib(E, zz);
+    if (F) {
+      const xa = Math.max(PL, X(Math.min(F.a.i, F.b.i))), lv = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
+      s.push(`<line x1="${x2(X(F.a.i))}" y1="${x2(Y(F.a.p))}" x2="${x2(X(F.b.i))}" y2="${x2(Y(F.b.p))}" stroke="${COL.fib}" stroke-dasharray="3 4" stroke-opacity="0.8"/>`);
+      lv.forEach((r) => { const p = F.ret(r); if (!inY(p)) return; const y = Y(p); s.push(`<line x1="${x2(xa)}" x2="${x2(X(n + 8))}" y1="${x2(y)}" y2="${x2(y)}" stroke="${COL.fib}" stroke-opacity="${r === 0.618 || r === 0.5 ? 0.75 : 0.4}"/>`); lab(xa + 4, y - 4, r + ' (' + fp(p) + ')', COL.fib, 'start', 11); });
+      const g1 = F.ret(0.618), g2 = F.ret(0.65); if (inY(g1)) s.push(`<rect x="${x2(xa)}" y="${x2(Math.min(Y(g1), Y(g2)))}" width="${x2(X(n + 8) - xa)}" height="${x2(Math.abs(Y(g1) - Y(g2)) + 1)}" fill="${COL.fib}" fill-opacity="0.12"/>`);
+    }
+  } catch (e) {}
+  // EMA
+  [['e50', COL.e50], ['e200', COL.e200]].forEach(([k, col]) => { const pts = []; for (let i = i0; i < n; i++) if (A[k][i] > 0) pts.push(x2(X(i)) + ',' + x2(Y(A[k][i]))); s.push(`<polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="1.3" stroke-opacity="0.8"/>`); });
+  // trendlines: active ones with 2+ touches, most recent first
+  let tri = null;
+  try {
+    const TL = globalThis.hxTrendlines(E, A).filter((l) => l.brk == null && l.touches >= 2 && l.b >= i0 - 50 && l.conf < n);
+    const pick = (res) => TL.filter((l) => l.res === res).sort((a, b) => b.b - a.b || Math.abs(a.at(n - 1) - px) - Math.abs(b.at(n - 1) - px)).slice(0, 2);
+    const R = pick(true), S = pick(false);
+    [...R, ...S].forEach((l, k) => { const xa = Math.max(l.a, i0 - 2), xb = n + pad - 4; s.push(`<line x1="${x2(X(xa))}" y1="${x2(Y(l.at(xa)))}" x2="${x2(X(xb))}" y2="${x2(Y(l.at(xb)))}" stroke="${l.res ? COL.res : COL.sup}" stroke-width="${k % 2 ? 1.4 : 2}"/>`); lab(X(l.b) + 6, Y(l.at(l.b)) + (l.res ? -8 : 16), (l.res ? (l.at(n) < l.at(l.a) ? 'Нисх. трендовая' : 'Сопротивление') : (l.at(n) > l.at(l.a) ? 'Восх. поддержка' : 'Поддержка')) + ' · ' + l.touches + ' кас.', l.res ? COL.res : COL.sup, 'start', 12, true); });
+    if (R[0] && S[0]) {
+      const sr = (R[0].at(n) / R[0].at(n - 20) - 1) * 100, ss = (S[0].at(n) / S[0].at(n - 20) - 1) * 100, gap0 = R[0].at(n) - S[0].at(n), gap1 = R[0].at(n + 30) - S[0].at(n + 30);
+      if (gap0 > 0 && gap1 < gap0) { tri = sr < -0.15 && ss > 0.15 ? 'Симметричный треугольник' : Math.abs(sr) <= 0.15 && ss > 0.15 ? 'Восходящий треугольник' : sr < -0.15 && Math.abs(ss) <= 0.15 ? 'Нисходящий треугольник' : sr < 0 && ss < 0 ? 'Нисходящий клин' : sr > 0 && ss > 0 ? 'Восходящий клин' : 'Сужение'; lab(X(n - 8), (Y(R[0].at(n - 8)) + Y(S[0].at(n - 8))) / 2 + 4, tri, '#ffa726', 'end', 14, true); }
+    }
+  } catch (e) {}
+  // liquidation clusters (largest 2 per side)
+  const mx = Math.max(1, ...(o.zs || []).map((z) => z.v));
+  [1, 0].forEach((side) => (o.zs || []).filter((z) => z.side === side && (side ? z.lo > px : z.hi < px)).sort((a, b) => b.v - a.v).slice(0, 2).forEach((z) => { const p = side ? z.lo : z.hi; if (!inY(p)) return; const y = Y(p); s.push(`<line x1="${x2(X(n - 30))}" x2="${PR}" y1="${x2(y)}" y2="${x2(y)}" stroke="${side ? COL.liqS : COL.liqL}" stroke-width="${1 + 2 * z.v / mx}" stroke-dasharray="7 4" stroke-opacity="0.85"/>`); lab(X(n - 30) + 4, y - 5, 'Ликв. ' + (side ? 'шортов' : 'лонгов') + ' ≈' + (z.v * (o.scale || 1) / 1e6).toFixed(1) + ' млн', side ? COL.liqS : COL.liqL, 'start', 11); }));
+  // liquidity pools: unswept swing highs (BSL) / lows (SSL); recent sweeps marked
+  (o.liq || []).filter((q) => inY(q.p) && q.i >= i0 - 100).sort((x, y) => Math.abs(x.p - px) - Math.abs(y.p - px)).slice(0, 6).forEach((q) => {
+    const y = Y(q.p), xa = Math.max(PL, X(q.i)), col = '#b388ff';
+    if (q.swept) { const xs = X(q.sweepI); s.push(`<line x1="${x2(xa)}" x2="${x2(xs)}" y1="${x2(y)}" y2="${x2(y)}" stroke="${col}" stroke-opacity="0.5" stroke-dasharray="2 3"/><circle cx="${x2(xs)}" cy="${x2(y)}" r="4" fill="none" stroke="${col}"/>`); lab(xs + 6, y + (q.side === 'hi' ? -6 : 14), 'свип ' + fp(q.p), col, 'start', 11, true); return; }
+    s.push(`<line x1="${x2(xa)}" x2="${PR}" y1="${x2(y)}" y2="${x2(y)}" stroke="${col}" stroke-width="${q.n > 1 ? 2 : 1.2}" stroke-dasharray="1 4" stroke-linecap="round"/>`);
+    lab(PR - 6, y + (q.side === 'hi' ? -5 : 13), (q.side === 'hi' ? '$$$ BSL ' : '$$$ SSL ') + fp(q.p) + (q.n > 1 ? (q.side === 'hi' ? ' равные хаи' : ' равные лои') : ''), col, 'end', 11, true);
+  });
+  // volume histogram along the bottom of the plot
+  { let vmx = 0; for (let i = i0; i < n; i++) vmx = Math.max(vmx, rows[i][6] || 0);
+    if (vmx > 0) for (let i = i0; i < n; i++) { const v = rows[i][6] || 0, h = 70 * v / vmx, x = X(i); s.push(`<rect x="${x2(x - cw * 0.35)}" y="${x2(PB - h)}" width="${x2(Math.max(1, cw * 0.7))}" height="${x2(h)}" fill="${rows[i][4] >= rows[i][1] ? COL.up : COL.dn}" fill-opacity="0.28"/>`); } }
+  // candles
+  const bw = Math.max(1, cw * 0.7);
+  for (let i = i0; i < n; i++) { const [t, op, h, l, c] = rows[i], col = c >= op ? COL.up : COL.dn, x = X(i); s.push(`<line x1="${x2(x)}" x2="${x2(x)}" y1="${x2(Y(h))}" y2="${x2(Y(l))}" stroke="${col}"/><rect x="${x2(x - bw / 2)}" y="${x2(Y(Math.max(op, c)))}" width="${x2(bw)}" height="${x2(Math.max(1, Math.abs(Y(op) - Y(c))))}" fill="${col}"/>`); }
+  // position boxes (TradingView-like), preferred first
+  (o.plans || []).forEach((p, k) => {
+    const xa = X(n + 2 + k * 21), xb = X(n + 20 + k * 21), op = p.pref ? 1 : 0.45, w = xb - xa;
+    const box = (a, b, col, fo) => { const y1 = Y(Math.max(a, b)), y2 = Y(Math.min(a, b)); s.push(`<rect x="${x2(xa)}" y="${x2(y1)}" width="${x2(w)}" height="${x2(Math.max(2, y2 - y1))}" fill="${col}" fill-opacity="${fo * op}" stroke="${col}" stroke-opacity="${0.8 * op}"/>`); };
+    box(p.entry, p.tp2, '#26a69a', 0.1); box(p.entry, p.tp1, '#26a69a', 0.25); box(p.entry, p.stop, '#ef5350', 0.25);
+    s.push(`<line x1="${x2(xa)}" x2="${x2(xb)}" y1="${x2(Y(p.entry))}" y2="${x2(Y(p.entry))}" stroke="#ffffff" stroke-opacity="${op}" stroke-width="1.5"/>`);
+    if (!p.now) s.push(`<line x1="${x2(X(n - 1))}" x2="${x2(xa)}" y1="${x2(Y(px))}" y2="${x2(Y(p.entry))}" stroke="#ffffff" stroke-opacity="${0.5 * op}" stroke-dasharray="4 4"/>`);
+    const head = (p.dir > 0 ? 'ЛОНГ' : 'ШОРТ') + (p.pref ? ' ★' : '');
+    const yTop = Y(Math.max(p.entry, p.stop, p.tp2)) - 8;
+    lab(xa + w / 2, Math.max(PT + 14, yTop), head, p.dir > 0 ? '#26a69a' : '#ef5350', 'middle', 14, true);
+    lab(xa + 4, Y(p.entry) - 4, 'Вход ' + fp(p.entry), '#ffffff', 'start', 11, true);
+    lab(xa + 4, Y(p.stop) + (p.dir > 0 ? 14 : -5), 'SL ' + fp(p.stop), '#ef5350', 'start', 11, true);
+    lab(xa + 4, Y(p.tp1) + (p.dir > 0 ? -5 : 14), 'TP1 ' + fp(p.tp1), '#26a69a', 'start', 11, true);
+    if (inY(p.tp2)) lab(xa + 4, Y(p.tp2) + (p.dir > 0 ? -5 : 14), 'TP2 ' + fp(p.tp2), '#26a69a', 'start', 11);
+  });
+  // current price
+  const yp = Y(px); s.push(`<line x1="${PL}" x2="${PR}" y1="${x2(yp)}" y2="${x2(yp)}" stroke="#ffffff" stroke-opacity="0.35" stroke-dasharray="2 3"/>`);
+  // labels with dark backing, simple vertical de-collision per column
+  const placed = [];
+  labels.forEach((L) => { let y = L.y; for (let k = 0; k < 6; k++) { const hit = placed.find((q) => Math.abs(q.x - L.x) < 140 && Math.abs(q.y - y) < L.size + 2); if (!hit) break; y = hit.y + (L.size + 3); } placed.push({x: L.x, y}); const tw = L.t.length * L.size * 0.56, bx = L.anchor === 'middle' ? L.x - tw / 2 : L.anchor === 'end' ? L.x - tw : L.x; s.push(`<rect x="${x2(bx - 3)}" y="${x2(y - L.size + 1)}" width="${x2(tw + 6)}" height="${L.size + 4}" fill="${COL.bg}" fill-opacity="0.78" rx="2"/><text x="${x2(L.x)}" y="${x2(y)}" fill="${L.col}" font-size="${L.size}" text-anchor="${L.anchor}"${L.bold ? ' font-weight="700"' : ''}>${esc(L.t)}</text>`); });
+  s.push('</g>');
+  s.push(`<rect x="${PR + 2}" y="${x2(yp - 10)}" width="${W - PR - 4}" height="20" fill="#ffffff"/><text x="${PR + 8}" y="${x2(yp + 5)}" fill="#000" font-size="13" font-weight="700">${fp(px)}</text>`);
+  // header and legend
+  s.push(`<text x="${PL + 4}" y="24" fill="#ffffff" font-size="18" font-weight="700">${esc(o.title)}</text><text x="${PL + 4}" y="46" fill="${COL.txt}" font-size="13">${esc(o.sub || '')}</text>`);
+  s.push(`<text x="${PL + 4}" y="${H - 14}" fill="${COL.mut}" font-size="12">EMA50 голубая, EMA200 оранжевая · жёлтые: Фибо · цветной пунктир: ликвидации · фиолетовые точки $$$: ликвидность за хаями/лоями · ★ основная сделка. Не рекомендация.</text>`);
+  s.push('</svg>');
+  const svg = s.join('');
+  if (!Resvg) return {svg, png: null, tri};
+  const png = new Resvg(svg, {background: COL.bg, font: {loadSystemFonts: true, defaultFontFamily: 'Arial'}, fitTo: {mode: 'width', value: W}}).render().asPng();
+  return {svg, png, tri};
+}
+if (typeof module !== 'undefined' && module.exports) module.exports = {render}; else window.HXChart = {render};
+
+})();</script>
+<script>'use strict';
+const f2 = (p) => p == null || isNaN(p) ? '—' : '$' + (p >= 10000 ? Math.round(p).toLocaleString('en-US') : p >= 100 ? p.toFixed(1) : p.toFixed(2));
+const pc = (p, c) => ((p / c - 1) * 100 >= 0 ? '+' : '') + ((p / c - 1) * 100).toFixed(2) + '%';
+const usd = (v) => !v ? '$0' : Math.abs(v) >= 1e9 ? '$' + (v / 1e9).toFixed(2) + ' млрд' : Math.abs(v) >= 1e6 ? '$' + (v / 1e6).toFixed(1) + ' млн' : '$' + Math.round(v / 1e3) + ' тыс.';
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const NOTE = '\n\n<i>Правила и статистика, не инвестиционная рекомендация.</i>';
+const rowsOf = (c, tf) => tf === '4h' ? c.r4 : tf === '1h' ? c.h1 : c.m15;
+const TFH = {'15m': 0.25, '1h': 1, '4h': 4};
+
+// ---------- technical levels and bias for a timeframe ----------
+const cache = {};
+function tfPack(c, tf) {
+  const key = tf + c.t + (tf === '15m' ? c.m15t : ''); if (cache[key]) return cache[key];
+  Object.keys(cache).forEach((k) => delete cache[k]);
+  const E = tf === '4h' ? c.E : globalThis.hxEngine(rowsOf(c, tf)), A = tf === '4h' ? c.A : globalThis.hxAnalyze(E);
+  const n = E.n, i = n - 2, atr = A.atr[i], px = c.c;
+  const lv = [];
+  A.labels.filter((l) => l.i > n - 150).forEach((l) => lv.push({p: l.p, w: 1, src: l.up ? 'лок. максимум' : 'лок. минимум'}));
+  lv.push({p: A.e50[n - 1], w: 1, src: 'EMA50'}, {p: A.e200[n - 1], w: 1.5, src: 'EMA200'});
+  try { globalThis.hxTrendlines(E, A).filter((l) => l.brk == null && l.touches >= 2).forEach((l) => lv.push({p: l.at(n - 1), w: 1.2, src: l.res ? 'наклонка сверху' : 'наклонка снизу'})); } catch (e) {}
+  const mx = Math.max(1, ...c.zs.map((z) => z.v));
+  c.zs.filter((z) => z.v >= mx * 0.3).forEach((z) => lv.push({p: z.side ? z.lo : z.hi, w: 1 + z.v / mx, src: (z.side ? 'ликв. шортов ' : 'ликв. лонгов ') + usd(z.v * c.scale)}));
+  // merge levels closer than 0.35 ATR
+  const lvls = lv.filter((l) => l.p > 0).sort((a, b) => a.p - b.p), zones = [];
+  lvls.forEach((l) => { const z = zones[zones.length - 1]; if (z && l.p - z.hi <= 0.35 * atr && l.p - z.lo <= 0.7 * atr) { z.hi = l.p; z.w += l.w; z.src.push(l.src); } else zones.push({lo: l.p, hi: l.p, w: l.w, src: [l.src]}); });
+  zones.forEach((z) => { z.mid = (z.lo + z.hi) / 2; z.src = [...new Set(z.src)]; });
+  const sup = zones.filter((z) => z.hi < px - 0.1 * atr).sort((a, b) => b.hi - a.hi), res = zones.filter((z) => z.lo > px + 0.1 * atr).sort((a, b) => a.lo - b.lo);
+  // bias
+  const why = []; let sc = 0;
+  const add = (v, t) => { sc += v; why.push((v > 0 ? '＋ ' : '－ ') + t); };
+  if (px > A.e200[n - 1]) add(1, 'цена выше EMA200 ' + tf); else add(-1, 'цена ниже EMA200 ' + tf);
+  if (A.e50[n - 1] > A.e200[n - 1]) add(1, 'EMA50 выше EMA200'); else add(-1, 'EMA50 ниже EMA200');
+  const br = A.breaks[A.breaks.length - 1]; if (br) add(br.up ? 1 : -1, 'последний слом структуры ' + (br.up ? 'вверх' : 'вниз') + ' (' + br.t + ')');
+  if (tf === '15m') { const e4 = c.A.e200[c.E.n - 1]; if (px > e4) add(1, 'цена выше EMA200 4H'); else add(-1, 'цена ниже EMA200 4H'); }
+  if (c.btc) { if (tf === '4h' ? c.btc.bull1d : c.btc.bull4h) add(1, 'BTC выше EMA200 ' + (tf === '4h' ? '1D' : '4H')); else add(-1, 'BTC ниже EMA200 ' + (tf === '4h' ? '1D' : '4H')); }
+  const rsi = A.rsi[i]; if (rsi > 70) add(-1, 'RSI ' + rsi.toFixed(0) + ': перекупленность'); if (rsi < 30) add(1, 'RSI ' + rsi.toFixed(0) + ': перепроданность');
+  if (c.H && c.H.fund != null) { const y = c.H.fund * 24 * 365 * 100; if (y > 30) add(-1, 'funding ' + y.toFixed(0) + '% год.: лонги перегреты'); if (y < -10) add(1, 'funding отрицательный: топливо для сквиза'); }
+  // whales: the absolute short is mostly hedges of staked/spot HYPE, so only the 24h change in net position counts
+  const wh = (c.st && c.st.whaleHist) || [], wNow = wh[wh.length - 1], wOld = wh.find((h) => wNow && wNow.t - h.t <= 26 * 3600e3 && wNow.t - h.t >= 20 * 3600e3);
+  if (wNow && wOld) { const d = wNow.net - wOld.net; if (d > 15e6) add(1, 'киты за сутки добавили лонга/закрыли шорт на ' + usd(d)); else if (d < -15e6) add(-1, 'киты за сутки добавили шорта/закрыли лонг на ' + usd(-d)); }
+  // stretched move: price far from EMA50 on this timeframe favours a bounce (scalp context)
+  const ext = (px - A.e50[n - 1]) / atr; if (ext <= -2.5) add(1, 'цена ' + (-ext).toFixed(1) + ' ATR ниже EMA50: растянуто вниз, вероятен откат вверх'); if (ext >= 2.5) add(-1, 'цена ' + ext.toFixed(1) + ' ATR выше EMA50: растянуто вверх, вероятен откат');
+  const bias = sc >= 2 ? 'long' : sc <= -2 ? 'short' : 'flat';
+  return (cache[key] = {E, A, n, atr, px, sup, res, bias, sc, why, rsi, rows: rowsOf(c, tf)});
+}
+// how often (on this timeframe's history) +goal was reached before -stop, from any bar close
+function baseRate(P, goal, stopPct, dir, horizon) {
+  const R = P.rows, n = R.length - 1; let win = 0, loss = 0, bars = [];
+  for (let k = Math.max(1, n - 1500); k < n - 1; k++) {
+    const e = R[k][4], up = e * (1 + (dir > 0 ? goal : stopPct) / 100), dn = e * (1 - (dir > 0 ? stopPct : goal) / 100);
+    for (let j = k + 1; j <= Math.min(n, k + horizon); j++) {
+      const hU = R[j][2] >= up, hD = R[j][3] <= dn;
+      if (hU && hD) { loss++; break; }
+      if (dir > 0 ? hU : hD) { win++; bars.push(j - k); break; }
+      if (dir > 0 ? hD : hU) { loss++; break; }
+    }
+  }
+  bars.sort((a, b) => a - b);
+  return {p: win + loss ? 100 * win / (win + loss) : 0, n: win + loss, med: bars.length ? bars[bars.length >> 1] : null};
+}
+function zoneTxt(z) { return f2(z.lo) + (z.hi - z.lo > 0.001 * z.lo ? '–' + f2(z.hi) : '') + ' (' + z.src.slice(0, 3).join(', ') + ')'; }
+
+// liquidity: unswept swing highs (buy-side, BSL) and lows (sell-side, SSL); equal highs/lows are stronger pools; recent sweeps marked
+function liquidity(P) {
+  const E = P.E, A = P.A, n = E.n, a = P.atr, out = [];
+  ['hi', 'lo'].forEach((side) => {
+    const piv = A.labels.filter((l) => (side === 'hi') === l.up && l.i > n - 250 && l.i < n - 2);
+    piv.forEach((l) => {
+      let swept = -1; for (let j = l.i + 1; j < n; j++) { if (side === 'hi' ? E.H[j] > l.p : E.L[j] < l.p) { swept = j; break; } }
+      const sweepBack = swept >= 0 && swept >= n - 12 && (side === 'hi' ? E.C[swept] < l.p : E.C[swept] > l.p);
+      if (swept < 0 || sweepBack) out.push({side, p: l.p, i: l.i, swept: swept >= 0, sweepI: swept});
+    });
+  });
+  // merge equal highs/lows (within 0.15 ATR)
+  const pools = [];
+  out.sort((x, y) => x.p - y.p).forEach((q) => { const z = pools.find((w) => w.side === q.side && w.swept === q.swept && Math.abs(w.p - q.p) <= 0.15 * a); if (z) { z.n++; z.p = q.side === 'hi' ? Math.max(z.p, q.p) : Math.min(z.p, q.p); z.i = Math.min(z.i, q.i); } else pools.push({...q, n: 1}); });
+  return pools;
+}
+// last closed 15m candles: rejection from the entry zone in the trade direction
+function confirm15(c, dir, entry) {
+  const R = c.m15; if (!R || R.length < 5) return null;
+  for (let k = R.length - 2; k >= R.length - 4; k--) {
+    const [t, o, h, l, cl] = R[k], rng = h - l || 1e-9;
+    if (dir < 0 && h >= entry && cl < entry && (h - Math.max(o, cl)) / rng >= 0.45) return {t, txt: 'отбой вниз: тень сверху ' + Math.round(100 * (h - Math.max(o, cl)) / rng) + '% свечи'};
+    if (dir > 0 && l <= entry && cl > entry && (Math.min(o, cl) - l) / rng >= 0.45) return {t, txt: 'отбой вверх: тень снизу ' + Math.round(100 * (Math.min(o, cl) - l) / rng) + '% свечи'};
+  }
+  return null;
+}
+// volume: share of volume on up vs down candles over the last 30 closed bars, and the last closed bar vs the 20-bar average
+function volStats(R) {
+  const n = R.length - 1, k0 = Math.max(0, n - 30); let up = 0, dn = 0, avg = 0;
+  for (let k = k0; k < n; k++) { const v = R[k][6] || 0; if (R[k][4] >= R[k][1]) up += v; else dn += v; }
+  for (let k = Math.max(0, n - 21); k < n - 1; k++) avg += (R[k][6] || 0) / 20;
+  return {ratio: dn ? up / dn : 1, last: R[n - 1][6] || 0, avg, spike: avg ? (R[n - 1][6] || 0) / avg : 1, ok: up + dn > 0};
+}
+function score(p, P, V, V15, htf, liq, tf, c) {
+  const f = []; let s = 0; const add = (v, t) => { s += v; f.push((v > 0 ? '+' + v : v) + ' ' + t); };
+  const al = Math.sign(P.sc) === p.dir;
+  if (al && Math.abs(P.sc) >= 2) add(2, 'по тренду ' + tf + ' (уклон ' + (P.sc > 0 ? '+' : '') + P.sc + ')'); else if (!al && Math.abs(P.sc) >= 2) add(-2, 'против тренда ' + tf + ' (уклон ' + (P.sc > 0 ? '+' : '') + P.sc + ')'); else add(0, 'тренд ' + tf + ' нейтральный');
+  if (htf === p.dir) add(1, 'старший ТФ в ту же сторону'); else if (htf === -p.dir) add(-1, 'старший ТФ против');
+  if (p.z.src.length >= 2) add(1, 'зона из ' + p.z.src.length + ' факторов (' + p.z.src.slice(0, 3).join(', ') + ')');
+  const sw = liq.find((q) => q.swept && q.sweepI >= P.n - 12 && (p.dir > 0 ? q.side === 'lo' : q.side === 'hi'));
+  if (sw) add(1, 'перед этим сняли ликвидность ' + (p.dir > 0 ? 'снизу ' : 'сверху ') + f2(sw.p));
+  if (V.ok) { const r = p.dir > 0 ? V.ratio : 1 / V.ratio; if (r >= 1.2) add(1, 'объём за 30 свечей на стороне ' + (p.dir > 0 ? 'покупок' : 'продаж') + ' (×' + r.toFixed(2) + ')'); else if (r <= 0.83) add(-1, 'объём на стороне ' + (p.dir > 0 ? 'продаж' : 'покупок') + ' (×' + (1 / r).toFixed(2) + ')'); }
+  if (p.conf) { add(2, 'подтверждение на 15m: ' + p.conf.txt); if (V15 && V15.spike >= 1.3) add(1, 'свеча подтверждения на объёме ×' + V15.spike.toFixed(1)); }
+  if (p.rr >= 2) add(1, 'R/R до TP1 1:' + p.rr.toFixed(1));
+  if (p.evR > 0) add(1, 'матожидание из случайной точки +' + p.evR.toFixed(2) + 'R'); else add(0, 'матожидание из случайной точки ' + p.evR.toFixed(2) + 'R');
+  if (p.wide) add(-2, 'стоп шире цели');
+  if (p.dir < 0) add(-1, 'шорт: на истории HYPE шорты в минусе');
+  p.score = Math.max(0, Math.min(10, s + 2)); p.factors = f;
+}
+function computePlans(c, tf, goal) {
+  const P = tfPack(c, tf), px = c.c, a = P.atr, hor = {'15m': 96, '1h': 48, '4h': 30}[tf], n = P.n;
+  const liq = liquidity(P), fvg = (P.A.fvg || []).filter((f) => f.end >= n - 1 && f.hi - f.lo <= 2.5 * a);
+  P.liq = liq; P.fvgOpen = fvg;
+  const mk = (dir) => {
+    const z = dir > 0 ? P.sup[0] : P.res[0]; if (!z) return null;
+    const entry = dir > 0 ? z.hi : z.lo;
+    // structural stop: beyond the zone, the nearest swing extreme and any opposing FVG around the entry, plus a buffer against sweeps
+    let base = dir > 0 ? z.lo : z.hi; const why = [dir > 0 ? 'зона ' + f2(z.lo) : 'зона ' + f2(z.hi)];
+    P.A.labels.filter((l) => l.i > n - 60 && (dir > 0 ? !l.up && l.p < entry && l.p > entry - 1.5 * a : l.up && l.p > entry && l.p < entry + 1.5 * a)).forEach((l) => { if (dir > 0 ? l.p < base : l.p > base) { base = l.p; why.push((dir > 0 ? 'лок. минимум ' : 'лок. максимум ') + f2(l.p)); } });
+    fvg.filter((f) => (dir > 0 ? f.up && f.hi >= entry - 0.3 * a && f.lo < entry && f.lo > entry - 1.5 * a : !f.up && f.lo <= entry + 0.3 * a && f.hi > entry && f.hi < entry + 1.5 * a)).forEach((f) => { const e = dir > 0 ? f.lo : f.hi; if (dir > 0 ? e < base : e > base) { base = e; why.push((f.up ? 'Bull' : 'Bear') + ' FVG ' + f2(f.lo) + '–' + f2(f.hi)); } });
+    const buf = Math.max(0.35 * a, px * 0.002);
+    let stop = base - dir * buf;
+    // a stop that lands inside or just short of an opposing FVG gets pushed beyond it (FVG edges attract wicks)
+    for (const f of fvg) { if (dir < 0 && !f.up && f.lo < stop && f.hi > stop && f.hi < entry + 2 * a) { stop = f.hi + buf * 0.5; why.push('Bear FVG ' + f2(f.lo) + '–' + f2(f.hi)); } if (dir > 0 && f.up && f.hi > stop && f.lo < stop && f.lo > entry - 2 * a) { stop = f.lo - buf * 0.5; why.push('Bull FVG ' + f2(f.lo) + '–' + f2(f.hi)); } }
+    const risk = Math.abs(entry - stop), sp = risk / entry * 100;
+    // targets in the trade direction: opposing zones, opposing FVG near edges, liquidity pools; exit slightly before each
+    const tg = [];
+    (dir > 0 ? P.res : P.sup).forEach((r) => tg.push({p: dir > 0 ? r.lo : r.hi, src: r.src.slice(0, 2).join(', ')}));
+    fvg.filter((f) => dir > 0 ? !f.up && f.lo > entry : f.up && f.hi < entry).forEach((f) => tg.push({p: dir > 0 ? f.lo : f.hi, src: (f.up ? 'Bull' : 'Bear') + ' FVG ' + f2(f.lo) + '–' + f2(f.hi)}));
+    liq.filter((q) => !q.swept && (dir > 0 ? q.side === 'hi' && q.p > entry : q.side === 'lo' && q.p < entry)).forEach((q) => tg.push({p: q.p, src: (q.side === 'hi' ? 'ликвидность над ' + (q.n > 1 ? 'равными хаями' : 'хаем') : 'ликвидность под ' + (q.n > 1 ? 'равными лоями' : 'лоем')), liq: true}));
+    tg.forEach((t) => { t.x = t.liq ? t.p + dir * 0.05 * a : t.p - dir * 0.1 * a; t.r = (t.x - entry) * dir / risk; });
+    const ord = tg.filter((t) => t.r > 0.3).sort((x, y) => x.r - y.r);
+    const blocker = ord.find((t) => t.r < 1.2) || null;
+    let t1 = ord.find((t) => t.r >= 1.2); if (!t1 || t1.r > 4) t1 = {x: entry + dir * risk * Math.max(1.5, goal / sp), src: 'по цели ' + goal + '% (не меньше 1.5R)', r: Math.max(1.5, goal / sp), plain: true};
+    let t2 = ord.find((t) => t.r >= Math.max(2, t1.r + 0.8)); if (!t2) t2 = {x: entry + dir * risk * Math.max(2.5, t1.r + 1), src: Math.max(2.5, t1.r + 1).toFixed(1) + 'R', r: Math.max(2.5, t1.r + 1)};
+    const g1 = Math.abs(t1.x / entry - 1) * 100, br = baseRate(P, g1, sp, dir, hor);
+    const evR = br.p / 100 * t1.r - (1 - br.p / 100);
+    const now = dir > 0 ? px <= entry + 0.25 * a && px >= stop : px >= entry - 0.25 * a && px <= stop;
+    const conf = confirm15(c, dir, entry), wide = sp > goal * 1.5;
+    const ev = evR - (wide ? 1 : 0) - (conf ? -0.2 : 0);
+    return {dir, z, entry, stop, sp, stopWhy: why, tp1: t1.x, tp1src: t1.src, tp1plain: !!t1.plain, tp2: t2.x, tp2src: t2.src, rr: t1.r, rr2: t2.r, g1, br, evR, ev, now, conf, wide, blocker};
+  };
+  const L = mk(1), S = mk(-1);
+  const V = volStats(P.rows), V15 = c.m15 ? volStats(c.m15) : null;
+  const htf = (() => { const A4 = c.A, n4 = c.E.n; return tf === '4h' ? (c.btc && c.btc.bull1d ? 1 : -1) : (c.c > A4.e200[n4 - 1] && A4.e50[n4 - 1] > A4.e200[n4 - 1] ? 1 : c.c < A4.e200[n4 - 1] && A4.e50[n4 - 1] < A4.e200[n4 - 1] ? -1 : 0); })();
+  [L, S].filter(Boolean).forEach((p) => score(p, P, V, V15, htf, liq, tf, c));
+  const pref = [L, S].filter(Boolean).sort((x, y) => y.score - x.score)[0] || null, other = pref === L ? S : L;
+  if (pref) pref.pref = true;
+  const verdict = !pref ? 'none' : pref.score >= 6 && pref.conf ? 'go' : pref.score >= 6 ? 'ready' : 'wait';
+  return {P, plans: pref ? [pref] : [], pref, other, verdict, goal, tf, liq, V, htf};
+}
+function scalpScreen(c, tf, goal) {
+  const K = computePlans(c, tf, goal), P = K.P, px = c.c, a = P.atr;
+  const L = ['<b>' + (tf === '4h' ? '📐 Свинг ' : tf === '1h' ? '⏱ Интрадей ' : '⚡ Скальп ') + goal + '% · ' + tf.toUpperCase() + '</b> · HYPE ' + f2(px)];
+  const VD = {go: '✅ СДЕЛКА', ready: '⏳ ГОТОВИМСЯ: ждём подтверждение на 15m', wait: '⛔ СДЕЛКИ НЕТ: сигнал слабый, ждём', none: '⛔ СДЕЛКИ НЕТ: нет уровней'};
+  L.push('<b>' + VD[K.verdict] + '</b>' + (K.pref ? ' · ' + (K.pref.dir > 0 ? '🟢 ЛОНГ' : '🔴 ШОРТ') + ' · уверенность <b>' + K.pref.score + '/10</b>' : ''));
+  L.push('ATR ' + tf + ': ' + f2(a) + ' (' + (a / px * 100).toFixed(2) + '% за свечу) · уклон ' + {long: 'ЛОНГ', short: 'ШОРТ', flat: 'нейтральный'}[P.bias] + ' (' + (P.sc > 0 ? '+' : '') + P.sc + ')');
+  P.why.forEach((w) => L.push('  ' + esc(w)));
+  L.push('');
+  L.push('Поддержки: ' + (P.sup.slice(0, 3).map(zoneTxt).join('; ') || '—'));
+  L.push('Сопротивления: ' + (P.res.slice(0, 3).map(zoneTxt).join('; ') || '—'));
+  const bsl = K.liq.filter((q) => q.side === 'hi' && !q.swept && q.p > px).sort((x, y) => x.p - y.p).slice(0, 2), ssl = K.liq.filter((q) => q.side === 'lo' && !q.swept && q.p < px).sort((x, y) => y.p - x.p).slice(0, 2), sw = K.liq.filter((q) => q.swept);
+  L.push('💧 Ликвидность сверху: ' + (bsl.map((q) => f2(q.p) + (q.n > 1 ? ' (равные хаи ×' + q.n + ')' : '')).join(', ') || '—') + ' · снизу: ' + (ssl.map((q) => f2(q.p) + (q.n > 1 ? ' (равные лои ×' + q.n + ')' : '')).join(', ') || '—'));
+  if (sw.length) L.push('   Недавно снята: ' + sw.map((q) => f2(q.p) + (q.side === 'hi' ? ' сверху' : ' снизу')).join(', ') + ' (свип с возвратом — часто разворот)');
+  K.plans.forEach((p) => {
+    L.push(''); L.push('<b>' + (p.dir > 0 ? '🟢 ЛОНГ' : '🔴 ШОРТ') + ' — план</b>' + (p.now ? ' · цена в зоне' : ' · ждать ' + f2(p.entry) + ' (' + pc(p.entry, px) + ')'));
+    L.push('Вход ' + f2(p.entry) + ' от ' + esc(p.z.src.slice(0, 2).join(', ')) + ' — только после подтверждения на 15m (' + (p.dir > 0 ? 'тень снизу и закрытие выше зоны' : 'тень сверху и закрытие ниже зоны') + ')' + (p.conf ? ': ✅ есть, ' + p.conf.txt : ''));
+    L.push('Стоп ' + f2(p.stop) + ' (−' + p.sp.toFixed(2) + '%) — за ' + esc(p.stopWhy.slice(-2).join(' и ')) + ' с запасом от свипа');
+    L.push('Тейк 1: ' + f2(p.tp1) + ' (R/R 1:' + p.rr.toFixed(1) + ', ' + (p.tp1plain ? '' : 'перед ') + esc(p.tp1src) + ')');
+    L.push('Тейк 2: ' + f2(p.tp2) + ' (R/R 1:' + p.rr2.toFixed(1) + ', ' + esc(p.tp2src) + ')');
+    if (p.blocker) L.push('⚠️ По пути ' + f2(p.blocker.p) + ' (' + esc(p.blocker.src) + '): возможна реакция, после тейка 1 стоп в безубыток.');
+    if (p.wide) L.push('⚠️ Стоп ' + p.sp.toFixed(2) + '% шире цели ' + goal + '%: для ' + tf + ' сетап слабый, меньший размер или пропустить.');
+    L.push('Из случайной точки такая сделка выигрывала в ' + p.br.p.toFixed(0) + '% случаев → матожидание ' + (p.evR >= 0 ? '+' : '') + p.evR.toFixed(2) + 'R.');
+    L.push(''); L.push('<b>Почему ' + p.score + '/10:</b>'); p.factors.forEach((t) => L.push('  ' + esc(t)));
+    L.push('Правило: вход при 6/10 и выше и только с подтверждением на 15m.');
+  });
+  if (K.other) L.push('\nОбратная сторона (' + (K.other.dir > 0 ? 'лонг' : 'шорт') + ' от ' + f2(K.other.entry) + '): ' + K.other.score + '/10 — не берём' + (K.other.score >= 6 ? ', но следим' : '') + '.');
+  if (K.V && K.V.ok) L.push('Объём ' + tf + ': последняя свеча ×' + K.V.spike.toFixed(1) + ' к среднему, за 30 свечей покупки/продажи ' + K.V.ratio.toFixed(2) + '.');
+  L.push(''); L.push('Отмена: закрытие свечи ' + tf + ' за стопом. Шорты на истории HYPE были убыточны: только от сильного сопротивления и с подтверждением.');
+  if (c.btcWarn) L.push(esc(c.btcWarn.trim()));
+  return {text: L.join('\n') + NOTE, K};
+}
+</script>
+<script>'use strict';
+// HYPE live chart (Telegram Mini App). Data straight from Bybit public API + WebSocket; analysis = the same engine the bot uses.
+const TG = window.Telegram && window.Telegram.WebApp; try { TG && TG.ready(); TG && TG.expand(); } catch (e) {}
+const IV = {'5m': '5', '15m': '15', '1h': '60', '4h': '240'}, GOAL = {'5m': 0.7, '15m': 1, '1h': 1.5, '4h': 3};
+const S = {tf: (() => { try { return localStorage.getItem('hl_tf') || '15m'; } catch (e) { return '15m'; } })(), bars: 80, off: 0, c: null, K: null, ws: null, last: 0};
+const $ = (q) => document.querySelector(q);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function jget(u, opt) { const r = await fetch(u, opt); if (!r.ok) throw new Error(r.status + ' ' + u); return r.json(); }
+async function klines(sym, iv, bars) {
+  let end = Date.now(), out = [];
+  while (out.length < bars) {
+    const j = await jget(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${sym}&interval=${iv}&limit=1000&end=${end}`);
+    const l = j.result.list; if (!l.length) break;
+    out = l.map((r) => [+r[0], +r[1], +r[2], +r[3], +r[4], null, +r[5]]).reverse().concat(out);
+    end = +l[l.length - 1][0] - 1; if (l.length < 1000) break;
+  }
+  return out;
+}
+async function oiHist(bars) {
+  let end = Date.now(), out = [];
+  while (out.length < bars) {
+    const j = await jget(`https://api.bybit.com/v5/market/open-interest?category=linear&symbol=HYPEUSDT&intervalTime=4h&limit=200&endTime=${end}`);
+    const l = j.result.list; if (!l.length) break;
+    out = l.map((r) => [+r.timestamp, +r.openInterest]).reverse().concat(out);
+    end = +l[l.length - 1].timestamp - 1; if (l.length < 200) break;
+  }
+  return out;
+}
+const emaA = (a, p) => { const k = 2 / (p + 1), o = [a[0]]; for (let i = 1; i < a.length; i++) o.push(a[i] * k + o[i - 1] * (1 - k)); return o; };
+
+// full context (same fields the bot builds)
+async function loadCtx() {
+  status('Загружаю данные Bybit…');
+  const [r4, oi, h1, m15, m5, b1d, b4h, tk] = await Promise.all([klines('HYPEUSDT', '240', 2000), oiHist(2000), klines('HYPEUSDT', '60', 1000), klines('HYPEUSDT', '15', 1000), klines('HYPEUSDT', '5', 1000), klines('BTCUSDT', 'D', 400), klines('BTCUSDT', '240', 400), jget('https://api.bybit.com/v5/market/tickers?category=linear&symbol=HYPEUSDT')]);
+  { const m = new Map(oi); let last = null; r4.forEach((r) => { const v = m.get(r[0]); if (v != null) last = v; r[5] = v != null ? v : last; }); }
+  status('Считаю анализ…'); await sleep(20);
+  const E = hxEngine(r4), A = hxAnalyze(E);
+  const zs = hxZones(E, E.last, 0.25).map((z) => ({side: z.side, lo: E.price(z.k0), hi: E.price(z.k1), v: z.v})).filter((z) => z.v > 0);
+  const t = tk.result.list[0], bybitOI = +t.openInterestValue;
+  let H = {}; try { const m = await jget('https://api.hyperliquid.xyz/info', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({type: 'metaAndAssetCtxs'})}); const i = m[0].universe.findIndex((u) => u.name === 'HYPE'); const x = m[1][i]; H = {oi: +x.openInterest * +x.markPx, fund: +x.funding}; } catch (e) {}
+  const scale = bybitOI > 0 && H.oi ? (H.oi + bybitOI) / bybitOI : 1;
+  const bC = b1d.map((r) => r[4]), bE = emaA(bC, 200), bi = bC.length - 2, b4 = b4h.map((r) => r[4]), b4E = emaA(b4, 200), b4i = b4.length - 2;
+  const btc = {px: bC[bC.length - 1], bull1d: bC[bi] > bE[bi], bull4h: b4[b4i] > b4E[b4i]};
+  const btcWarn = !btc.bull1d ? '\n⚠️ BTC ниже EMA200 1D: рынок в целом медвежий, лонги по HYPE рискованнее.' : !btc.bull4h ? '\n⚠️ BTC ниже EMA200 4H: краткосрочно слабый.' : '';
+  return {t: Date.now(), c: +t.lastPrice, r4, h1, m15, m5, E, A, zs, scale, H, btc, btcWarn, st: {}, m15t: Date.now()};
+}
+// bot functions expect rows for 15m/1h/4h; 5m reuses the 15m logic on 5m candles
+const rowsOfWeb = (c, tf) => tf === '4h' ? c.r4 : tf === '1h' ? c.h1 : tf === '5m' ? c.m5 : c.m15;
+
+function plan() {
+  const c = S.c, tf = S.tf, five = tf === '5m', keep = c.m15, keepT = c.m15t;
+  if (five) { c.m15 = c.m5; c.m15t = 'm5' + Date.now(); }
+  try { const r = scalpScreen(c, five ? '15m' : tf, GOAL[tf]); S.K = r.K; S.K.P = {...r.K.P, rows: five ? c.m5 : r.K.P.rows}; $('#plan').innerHTML = (five ? r.text.replace('15M</b>', '5M</b>') : r.text).replace(/\n/g, '<br>'); }
+  finally { if (five) { c.m15 = keep; c.m15t = keepT; } }
+}
+function draw() {
+  const c = S.c, K = S.K; if (!c || !K) return;
+  const box = $('#chart'), w = Math.max(360, box.clientWidth), h = Math.max(420, Math.round(window.innerHeight * 0.62));
+  const P = K.P, rows = P.rows, end = Math.max(30, rows.length - S.off);
+  const title = 'HYPEUSDT · ' + S.tf.toUpperCase() + ' · ' + c.c.toFixed(3) + (K.pref ? ' · ' + (K.pref.dir > 0 ? 'ЛОНГ' : 'ШОРТ') + ' ' + K.pref.score + '/10' : '');
+  const r = HXChart.render({rows, E: P.E, A: P.A, tf: S.tf === '5m' ? '15m' : S.tf, title, sub: 'live · Bybit · ' + new Date().toLocaleTimeString('ru-RU'), plans: S.off ? [] : K.plans, zs: c.zs, scale: c.scale, price: c.c, liq: K.liq, bars: S.bars, end, W: w, H: h, axisW: 62});
+  box.innerHTML = r.svg; const sv = box.querySelector('svg'); sv.setAttribute('width', w); sv.setAttribute('height', h);
+}
+function status(t) { $('#st').textContent = t; }
+
+// live updates: candle for the selected timeframe + ticker
+function wsConnect() {
+  try { S.ws && S.ws.close(); } catch (e) {}
+  const ws = S.ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+  ws.onopen = () => { ws.send(JSON.stringify({op: 'subscribe', args: ['kline.' + IV[S.tf] + '.HYPEUSDT', 'kline.15.HYPEUSDT', 'tickers.HYPEUSDT']})); status('● онлайн'); S.ping = setInterval(() => { try { ws.send('{"op":"ping"}'); } catch (e) {} }, 20000); };
+  ws.onclose = () => { clearInterval(S.ping); status('переподключение…'); setTimeout(wsConnect, 3000); };
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data); if (!m.topic || !S.c) return;
+    if (m.topic.startsWith('tickers')) { if (m.data.lastPrice) S.c.c = +m.data.lastPrice; return; }
+    const iv = m.topic.split('.')[1], k = m.data[0], rows = iv === '240' ? S.c.r4 : iv === '60' ? S.c.h1 : iv === '15' ? S.c.m15 : S.c.m5;
+    const row = [+k.start, +k.open, +k.high, +k.low, +k.close, rows[rows.length - 1][5], +k.volume], last = rows[rows.length - 1];
+    if (row[0] === last[0]) rows[rows.length - 1] = row; else if (row[0] > last[0]) { rows.push(row); rows.shift(); S.newBar = true; }
+    S.c.c = row[4];
+    if (k.confirm && iv === IV[S.tf]) S.newBar = true;
+  };
+}
+async function refreshAnalysis() { S.c.t = Date.now(); S.c.m15t = Date.now(); plan(); draw(); }
+setInterval(() => { if (!S.c) return; if (S.newBar) { S.newBar = false; refreshAnalysis(); } else draw(); }, 1500);
+setInterval(async () => { try { S.c = await loadCtx(); refreshAnalysis(); } catch (e) {} }, 15 * 60e3);
+
+// timeframe buttons, pan and zoom (drag / swipe, pinch, wheel, buttons)
+function setTf(tf) { S.tf = tf; S.off = 0; try { localStorage.setItem('hl_tf', tf); } catch (e) {} document.querySelectorAll('.tf').forEach((b) => b.classList.toggle('on', b.dataset.tf === tf)); if (S.c) { refreshAnalysis(); wsConnect(); } }
+document.querySelectorAll('.tf').forEach((b) => b.addEventListener('click', () => setTf(b.dataset.tf)));
+$('#zin').onclick = () => { S.bars = Math.max(30, Math.round(S.bars * 0.75)); draw(); };
+$('#zout').onclick = () => { S.bars = Math.min(400, Math.round(S.bars * 1.33)); draw(); };
+$('#now').onclick = () => { S.off = 0; draw(); };
+{
+  const el = $('#chart'); let x0 = null, off0 = 0, d0 = null, b0 = 0;
+  const per = () => el.clientWidth / (S.bars + 46);
+  el.addEventListener('touchstart', (e) => { if (e.touches.length === 1) { x0 = e.touches[0].clientX; off0 = S.off; } if (e.touches.length === 2) { d0 = Math.abs(e.touches[0].clientX - e.touches[1].clientX); b0 = S.bars; } }, {passive: true});
+  el.addEventListener('touchmove', (e) => { if (e.touches.length === 1 && x0 != null) { S.off = Math.max(0, Math.round(off0 + (e.touches[0].clientX - x0) / per())); draw(); } if (e.touches.length === 2 && d0) { const d = Math.abs(e.touches[0].clientX - e.touches[1].clientX); S.bars = Math.max(30, Math.min(400, Math.round(b0 * d0 / Math.max(20, d)))); draw(); } }, {passive: true});
+  el.addEventListener('touchend', () => { x0 = null; d0 = null; });
+  el.addEventListener('mousedown', (e) => { x0 = e.clientX; off0 = S.off; });
+  window.addEventListener('mousemove', (e) => { if (x0 != null) { S.off = Math.max(0, Math.round(off0 + (e.clientX - x0) / per())); draw(); } });
+  window.addEventListener('mouseup', () => { x0 = null; });
+  el.addEventListener('wheel', (e) => { e.preventDefault(); S.bars = Math.max(30, Math.min(400, Math.round(S.bars * (e.deltaY > 0 ? 1.15 : 0.87)))); draw(); }, {passive: false});
+}
+window.addEventListener('resize', draw);
+(async () => {
+  setTf(S.tf);
+  for (let k = 0; k < 3; k++) { try { S.c = await loadCtx(); break; } catch (e) { status('Ошибка загрузки: ' + e.message + ' — повтор…'); await sleep(3000); } }
+  if (!S.c) return;
+  refreshAnalysis(); wsConnect();
+})();
+</script>
+</body></html>
